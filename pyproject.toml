@@ -1,0 +1,26 @@
+[project]
+name = "tiff-visualizer"
+version = "1.2.0"
+description = "Fast viewer for ImageJ/Fiji TIFF stacks and hyperstacks"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "tifffile",
+    "imagecodecs",
+    "PySide6",
+    "pyqtgraph",
+    "pillow",
+]
+
+[project.scripts]
+tiffviz = "tiff_visualizer.__main__:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["tiff_visualizer"]
+
+[tool.setuptools.package-data]
+tiff_visualizer = ["assets/*.svg", "assets/*.png"]
