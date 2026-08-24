@@ -43,6 +43,37 @@ from PySide6.QtWidgets import (
 from . import stack_io
 from .stack_io import TiffStack, load_stack
 
+# Menu text for the live z-projection methods; the abbreviations in
+# parentheses are what the toggle itself shows once a method is picked.
+PROJ_MENU_TEXT = {
+    "Max": "Max intensity",
+    "Min": "Min intensity",
+    "Mean": "Average",
+    "Median": "Median",
+    "Sum": "Sum slices",
+}
+
+
+def projection_menu(parent, current: str, on_pick) -> QMenu:
+    """Right-click menu of z-projection methods for a projection toggle."""
+    menu = QMenu(parent)
+    for method in stack_io.PROJECTION_METHODS:
+        action = menu.addAction(
+            f"{PROJ_MENU_TEXT[method]} ({stack_io.PROJECTION_ABBREV[method]})"
+        )
+        action.setCheckable(True)
+        action.setChecked(method == current)
+        action.triggered.connect(lambda _checked=False, m=method: on_pick(m))
+    return menu
+
+
+def projection_tooltip(method: str, all_stacks: bool = False) -> str:
+    scope = "all stacks in the grid" if all_stacks else "the stack"
+    return (
+        f"{PROJ_MENU_TEXT[method]} projection over z on {scope}\n"
+        "Right-click to change the projection type"
+    )
+
 pg.setConfigOptions(imageAxisOrder="row-major", background="#000000")
 
 PANE_MIME = "application/x-tiffviz-pane"
@@ -380,10 +411,14 @@ class StackPane(QWidget):
         self.probe_label = QLabel()
         bottom.addWidget(self.probe_label, 1)
         self.mip_box = None
+        self.proj_method = "Max"
         if stack.n_slices > 1:
-            self.mip_box = QCheckBox("MIP")
-            self.mip_box.setToolTip("Show the maximum intensity projection over z")
+            # Label doubles as the readout of which projection is live.
+            self.mip_box = QCheckBox(self._proj_label())
+            self.mip_box.setToolTip(projection_tooltip(self.proj_method))
             self.mip_box.setFocusPolicy(Qt.NoFocus)
+            self.mip_box.setContextMenuPolicy(Qt.CustomContextMenu)
+            self.mip_box.customContextMenuRequested.connect(self._show_proj_menu)
             self.mip_box.toggled.connect(self._on_mip_toggled)
             bottom.addWidget(self.mip_box)
         self.composite_box = None
@@ -775,6 +810,28 @@ class StackPane(QWidget):
     def _mip_on(self) -> bool:
         return self.mip_box.isChecked() if self.mip_box else False
 
+    def _proj_abbrev(self) -> str:
+        return stack_io.PROJECTION_ABBREV[self.proj_method]
+
+    def _proj_label(self) -> str:
+        return f"{self._proj_abbrev()} \u25be"
+
+    def _show_proj_menu(self, pos: QPoint):
+        menu = projection_menu(self.mip_box, self.proj_method, self.set_proj_method)
+        menu.exec(self.mip_box.mapToGlobal(pos))
+
+    def set_proj_method(self, method: str, enable: bool = True):
+        """Switch the live z projection; picking a method also switches it on."""
+        if self.mip_box is None or method not in stack_io.PROJECTION_METHODS:
+            return
+        self.proj_method = method
+        self.mip_box.setText(self._proj_label())
+        self.mip_box.setToolTip(projection_tooltip(method))
+        if enable and not self.mip_box.isChecked():
+            self.mip_box.setChecked(True)  # toggled -> refresh
+        elif self.mip_box.isChecked():
+            self.refresh()
+
     def _on_mip_toggled(self, on: bool):
         if "z" in self.bars:
             self.bars["z"].setEnabled(not on)
@@ -830,8 +887,8 @@ class StackPane(QWidget):
 
     def _render_key(self, t: int, z: int, stride: int) -> tuple:
         mip = self._mip_on()
-        return (t, -1 if mip else z, tuple(self._display_channels()), stride, mip,
-                self.stack.version)
+        return (t, -1 if mip else z, tuple(self._display_channels()), stride,
+                self.proj_method if mip else None, self.stack.version)
 
     def _store_cache(self, key: tuple, rgb: np.ndarray):
         self._plane_cache[key] = rgb
@@ -852,7 +909,9 @@ class StackPane(QWidget):
         key = self._render_key(t, z, stride)
         rgb = self._plane_cache.get(key)
         if rgb is None:
-            rgb = self.stack.render(t, z, self._display_channels(), stride, self._mip_on())
+            rgb = self.stack.render(
+                t, z, self._display_channels(), stride, self._mip_on(), self.proj_method
+            )
             self._store_cache(key, rgb)
         else:
             self._plane_cache.move_to_end(key)
@@ -880,7 +939,8 @@ class StackPane(QWidget):
                 render_pool.submit(
                     self,
                     self.stack,
-                    (t, z, list(self._display_channels()), stride, self._mip_on()),
+                    (t, z, list(self._display_channels()), stride, self._mip_on(),
+                     self.proj_method),
                     key,
                     self._render_request,
                 )
@@ -920,7 +980,11 @@ class StackPane(QWidget):
         if s.n_channels > 1:
             pos.append(f"c {c + 1}/{s.n_channels}")
         if s.n_slices > 1:
-            pos.append("z MIP" if self._mip_on() else f"z {z + 1}/{s.n_slices}")
+            pos.append(
+                f"z {self._proj_abbrev()}"
+                if self._mip_on()
+                else f"z {z + 1}/{s.n_slices}"
+            )
         if s.n_frames > 1:
             pos.append(f"t {t + 1}/{s.n_frames}")
         parts.append(" ".join(pos) if pos else "single image")
@@ -938,7 +1002,7 @@ class StackPane(QWidget):
         h, w = self.stack.shape_yx
         if 0 <= x < w and 0 <= y < h:
             t, z, c = self.position()
-            values = self.stack.values_at(t, z, y, x, self._mip_on())
+            values = self.stack.values_at(t, z, y, x, self._mip_on(), self.proj_method)
             fmt = (lambda v: f"{v:g}") if np.issubdtype(self.stack.dtype, np.floating) else str
             if self._composite_on():
                 val = " ".join(fmt(v) for v in values)
@@ -1019,6 +1083,7 @@ class StackPane(QWidget):
             self._display_channels(),
             stride=1,
             mip=self._mip_on(),
+            method=self.proj_method,
         )
 
     def _rgb_to_qimage(self, rgb: np.ndarray) -> QImage:
@@ -1029,7 +1094,9 @@ class StackPane(QWidget):
     def _export_name(self, suffix: str) -> str:
         t, z, c_ = self.position()
         base = Path(self.stack.name).stem
-        pos = f"_t{t + 1}" + ("_MIP" if self._mip_on() else f"_z{z + 1}")
+        pos = f"_t{t + 1}" + (
+            f"_{self._proj_abbrev()}" if self._mip_on() else f"_z{z + 1}"
+        )
         return f"{base}{pos}.{suffix}"
 
     def copy_view(self):
@@ -1078,7 +1145,8 @@ class StackPane(QWidget):
     # ---- stack montage (t across, z down) ------------------------------
 
     def _stack_montage_image(
-        self, t_idx, z_idx, channels, stride, labels, mip=False, on_tile=None, grid=None
+        self, t_idx, z_idx, channels, stride, labels, mip=False, on_tile=None, grid=None,
+        method="Max",
     ):
         """One montage sheet of this stack: t across columns, z down rows;
         a single varying axis wraps into a near-square grid instead, or into
@@ -1108,7 +1176,7 @@ class StackPane(QWidget):
                 )
                 for i, v in enumerate(seq)
             ]
-        first = s.render(cells[0][0], cells[0][1], channels, stride, mip)
+        first = s.render(cells[0][0], cells[0][1], channels, stride, mip, method)
         cell_h, cell_w = first.shape[:2]
         # t/z headers frame the sheet when both axes vary; a wrapped single
         # axis labels each tile's corner instead.
@@ -1131,7 +1199,11 @@ class StackPane(QWidget):
                 draw.text((4, header_h + r * cell_h + 3), f"z {z_idx[r] + 1}", fill=gray, font=font)
         rendered = first
         for t, z, r, c, corner in cells:
-            rgb = rendered if rendered is not None else s.render(t, z, channels, stride, mip)
+            rgb = (
+                rendered
+                if rendered is not None
+                else s.render(t, z, channels, stride, mip, method)
+            )
             rendered = None
             x, y = gutter_w + c * cell_w, header_h + r * cell_h
             canvas.paste(Image.fromarray(rgb), (x, y))
@@ -1183,7 +1255,7 @@ class StackPane(QWidget):
         written = []
         for i, channels in enumerate(channel_sets):
             img = self._stack_montage_image(
-                t_idx, z_idx, channels, stride, labels, mip, tick, grid
+                t_idx, z_idx, channels, stride, labels, mip, tick, grid, self.proj_method
             )
             if img is None:  # canceled
                 return
@@ -1231,7 +1303,11 @@ class StackMontageDialog(QDialog):
             form.addRow("Every nth t:", self.t_spin)
         self.z_combo = QComboBox()
         self.z_combo.addItem("All slices as rows", False)
-        self.z_combo.addItem("Max projection (MIP)", True)
+        self.z_combo.addItem(
+            f"{PROJ_MENU_TEXT[pane.proj_method]} projection "
+            f"({stack_io.PROJECTION_ABBREV[pane.proj_method]})",
+            True,
+        )
         if pane._mip_on():
             self.z_combo.setCurrentIndex(1)
         self.z_spin = QSpinBox()
@@ -1240,7 +1316,7 @@ class StackMontageDialog(QDialog):
             form.addRow("z:", self.z_combo)
             form.addRow("Every nth z:", self.z_spin)
         # Layout applies when a single axis varies (t, z, or t with z
-        # collapsed to a MIP); with both varying the sheet is always t
+        # collapsed to a projection); with both varying the sheet is always t
         # across × z down. The spinboxes always show the effective grid and
         # are editable only for the custom layout.
         self.layout_combo = QComboBox()
@@ -1294,8 +1370,9 @@ class StackMontageDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         form.addRow(buttons)
-        # Reopen with the last accepted options; a pane whose MIP is on
-        # still preselects the MIP export since that's what's on screen.
+        # Reopen with the last accepted options; a pane with its z
+        # projection on still preselects the collapsed export, in the pane's
+        # own method, since that's what's on screen.
         app_settings.restore_widgets("stackMontage", self._remembered())
         if pane._mip_on():
             self.z_combo.setCurrentIndex(1)
@@ -1718,9 +1795,8 @@ class FileDropMixin:
 
     def dropEvent(self, ev):
         paths = self._dropped_tiff_paths(ev.mimeData())
-        for path in paths:
-            open_path(path, self)
         if paths:
+            open_paths(paths, self)
             ev.acceptProposedAction()
 
 
@@ -1801,6 +1877,43 @@ def open_path(path: str | Path, parent: QWidget | None = None) -> StackPane | No
     return None
 
 
+def open_paths(paths, parent: QWidget | None = None) -> list[StackPane]:
+    """Open many stacks at once.
+
+    Memory-mappable stacks are loaded here and handed to the grid in a single
+    batch — adding them one at a time relayouts the whole grid per stack,
+    which is O(n²) for a folder of 48. Compressed stacks still load in the
+    background one by one, and failures are reported once at the end instead
+    of one dialog per file.
+    """
+    from .workspace import get_workspace, show_stack, workspace_active
+
+    stacks, deferred, failed = [], [], []
+    for path in paths:
+        path = Path(path)
+        try:
+            if stack_io.needs_decode(path):
+                deferred.append(path)
+            else:
+                stacks.append(load_stack(path))
+        except Exception as exc:  # noqa: BLE001 - collect, report once
+            failed.append(f"{path.name}: {exc}")
+    if workspace_active() and stacks:
+        panes = [StackPane(stack) for stack in stacks]
+        ws = get_workspace()
+        ws.add_panes(panes)
+        ws.raise_()
+    else:
+        panes = [show_stack(stack) for stack in stacks]
+    for path in deferred:
+        open_path(path, parent)
+    if failed:
+        QMessageBox.critical(
+            parent, "Cannot open stack", "\n".join(failed[:10])
+        )
+    return panes
+
+
 def open_stack_dialog(parent: QWidget | None = None):
     paths, _ = QFileDialog.getOpenFileNames(
         parent,
@@ -1810,8 +1923,7 @@ def open_stack_dialog(parent: QWidget | None = None):
     )
     if paths:
         app_settings.set_last_dir(str(Path(paths[0]).parent))
-    for path in paths:
-        open_path(path, parent)
+    open_paths(paths, parent)
 
 
 def open_folder(parent: QWidget | None = None, directory: str | Path | None = None):
@@ -1823,9 +1935,10 @@ def open_folder(parent: QWidget | None = None, directory: str | Path | None = No
         if not directory:
             return
     app_settings.set_last_dir(str(directory))
-    for path in sorted(Path(directory).iterdir()):
-        if path.suffix.lower() in (".tif", ".tiff"):
-            open_path(path, parent)
+    open_paths(
+        [p for p in sorted(Path(directory).iterdir()) if p.suffix.lower() in (".tif", ".tiff")],
+        parent,
+    )
 
 
 _CHEATSHEET = """

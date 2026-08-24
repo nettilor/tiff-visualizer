@@ -42,6 +42,7 @@ def capture() -> dict:
             "visible_channels": list(pane.visible_channels),
             "composite": pane._composite_on(),
             "mip": pane._mip_on(),
+            "proj": pane.proj_method,
             "locked": pane.shared_locked,
             "flagged": pane.flagged,
             "in_grid": ws_active and pane in ws.panes,
@@ -62,6 +63,7 @@ def capture() -> dict:
             "shared_view": ws.shared_view_checkbox.isChecked(),
             "minimalist": ws.minimal_checkbox.isChecked(),
             "mip_all": ws.mip_checkbox.isChecked(),
+            "proj_all": ws.proj_method,
             "flag_filter": ws.flag_checkbox.isChecked(),
             "shared_position": list(ws.shared_position()),
         }
@@ -102,8 +104,10 @@ def restore(data: dict, parent=None):
             pane.composite_box.blockSignals(True)
             pane.composite_box.setChecked(entry.get("composite", stack.composite))
             pane.composite_box.blockSignals(False)
-        if pane.mip_box is not None and entry.get("mip"):
-            pane.mip_box.setChecked(True)
+        if pane.mip_box is not None:
+            pane.set_proj_method(entry.get("proj", "Max"), enable=False)
+            if entry.get("mip"):
+                pane.mip_box.setChecked(True)
         t, z, c = entry.get("position", [0, 0, 0])
         for letter, value in (("t", t), ("z", z), ("c", c)):
             if letter in pane.bars:
@@ -126,6 +130,7 @@ def restore(data: dict, parent=None):
         ws.shared_channels_checkbox.setChecked(ws_info.get("shared_channels", False))
         ws.shared_view_checkbox.setChecked(ws_info.get("shared_view", False))
         ws.minimal_checkbox.setChecked(ws_info.get("minimalist", False))
+        ws.set_proj_method(ws_info.get("proj_all", "Max"), enable=False)
         ws.mip_checkbox.setChecked(ws_info.get("mip_all", False))
         ws.grid_combo.setCurrentIndex(ws_info.get("grid", 0))
         ws.add_panes([p for p, _locked in grid_panes])

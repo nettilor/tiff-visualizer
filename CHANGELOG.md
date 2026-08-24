@@ -1,5 +1,38 @@
 # Changelog
 
+## 1.3.1 — 2026-08-24
+
+### Viewing
+- **Z-projection type on the fly**: the per-pane projection checkbox is
+  labeled with the method it is running — **MIP** (max, as before), MIN, AVG,
+  MED or SUM — and right-clicking it offers Fiji's five methods (Max
+  intensity, Min intensity, Average, Median, Sum slices). Picking one also
+  switches the projection on, so swapping mid-scrub is one right-click. The
+  header reads `z AVG`, PNG/GIF exports are named `…_AVG` / `…_MED`, the
+  pixel probe reports projected values, and the Stack Montage's "collapse z"
+  option follows the pane's method. **MIP all** in the grid controls gained
+  the same menu and applies the choice to every tile. Sum scales its display
+  window with the slice count, so it reads like the mean on screen while the
+  probe still reports true sums. The method is saved in sessions.
+
+### Control window
+- **Open all / Close all** under each dropped folder's file list: open every
+  stack in the folder, or close every pane showing one of them (grid tiles
+  included). Each button greys out when it has nothing to do, and the status
+  bar reports how many stacks were opened or closed.
+
+### Performance
+- Opening or closing many stacks at once is no longer O(n²): stacks are added
+  to the grid in one batch (`viewer.open_paths`), tiles are closed in one
+  batch (`WorkspaceWindow.close_panes`), and the control window suspends its
+  refreshes for the duration — ~7× faster at 11 stacks, more as the count
+  grows. Open folder…, multi-file Open… and file drops share the same path.
+- Failures while opening a batch are collected into one dialog instead of one
+  per file.
+
+### App
+- Regression suite: 39 checks.
+
 ## 1.3.0 — 2026-08-24
 
 ### Export

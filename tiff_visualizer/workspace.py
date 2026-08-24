@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import settings as app_settings
+from . import stack_io
 from . import viewer
 from .stack_io import TiffStack
 from .viewer import DimBar, FileDropMixin, StackPane, StackWindow, build_menus
@@ -333,9 +334,12 @@ class WorkspaceWindow(FileDropMixin, QMainWindow):
         self.shared_view_checkbox.setFocusPolicy(Qt.NoFocus)
         self.shared_view_checkbox.toggled.connect(self._apply_shared_view)
         controls.addWidget(self.shared_view_checkbox)
-        self.mip_checkbox = QCheckBox("MIP all")
-        self.mip_checkbox.setToolTip("Max-project all stacks in the grid over z")
+        self.proj_method = "Max"
+        self.mip_checkbox = QCheckBox(self._proj_label())
+        self.mip_checkbox.setToolTip(viewer.projection_tooltip(self.proj_method, True))
         self.mip_checkbox.setFocusPolicy(Qt.NoFocus)
+        self.mip_checkbox.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.mip_checkbox.customContextMenuRequested.connect(self._show_proj_menu)
         self.mip_checkbox.toggled.connect(self._apply_mip_all)
         controls.addWidget(self.mip_checkbox)
         self.minimal_checkbox = QCheckBox("Minimalist")
@@ -449,7 +453,7 @@ class WorkspaceWindow(FileDropMixin, QMainWindow):
         if self.mip_checkbox.isChecked():
             for pane in panes:
                 if pane.mip_box is not None:
-                    pane.mip_box.setChecked(True)
+                    pane.set_proj_method(self.proj_method)
         if self.minimal_checkbox.isChecked():
             for pane in panes:
                 pane.set_minimal(True)
@@ -459,6 +463,11 @@ class WorkspaceWindow(FileDropMixin, QMainWindow):
 
     def take_pane(self, pane: StackPane):
         """Detach a pane (still alive) from the grid."""
+        self._detach_pane(pane)
+        self._after_detach()
+
+    def _detach_pane(self, pane: StackPane):
+        """Unhook one pane; the grid is left stale until _after_detach()."""
         self.panes.remove(pane)
         for signal, slot in (
             (pane.float_requested, float_pane),
@@ -477,7 +486,10 @@ class WorkspaceWindow(FileDropMixin, QMainWindow):
         pane.clear_shared()
         pane.viewbox.setXLink(None)
         pane.viewbox.setYLink(None)
-        if self.active_pane is pane:
+
+    def _after_detach(self):
+        """One rebuild for any number of removals (relayout is O(panes))."""
+        if self.active_pane not in self.panes:
             self._set_active(self.panes[0] if self.panes else None)
         self._relayout()
         self._update_title()
@@ -496,9 +508,15 @@ class WorkspaceWindow(FileDropMixin, QMainWindow):
         self._relayout()
 
     def close_pane(self, pane: StackPane):
-        self.take_pane(pane)
-        pane.unregister()
-        pane.deleteLater()
+        self.close_panes([pane])
+
+    def close_panes(self, panes: list[StackPane]):
+        """Close many tiles with a single grid rebuild."""
+        for pane in [p for p in panes if p in self.panes]:
+            self._detach_pane(pane)
+            pane.unregister()
+            pane.deleteLater()
+        self._after_detach()
         if not self.panes:
             self.hide()
 
@@ -718,12 +736,37 @@ class WorkspaceWindow(FileDropMixin, QMainWindow):
         if bar is not None:
             bar.toggle_playback()
 
-    # ---- MIP all -------------------------------------------------------
+    # ---- project all ---------------------------------------------------
+
+    def _proj_label(self) -> str:
+        return f"{stack_io.PROJECTION_ABBREV[self.proj_method]} all \u25be"
+
+    def _show_proj_menu(self, pos):
+        menu = viewer.projection_menu(
+            self.mip_checkbox, self.proj_method, self.set_proj_method
+        )
+        menu.exec(self.mip_checkbox.mapToGlobal(pos))
+
+    def set_proj_method(self, method: str, enable: bool = True):
+        """Pick the projection every tile uses; picking one also turns it on."""
+        if method not in stack_io.PROJECTION_METHODS:
+            return
+        self.proj_method = method
+        self.mip_checkbox.setText(self._proj_label())
+        self.mip_checkbox.setToolTip(viewer.projection_tooltip(method, True))
+        if enable and not self.mip_checkbox.isChecked():
+            self.mip_checkbox.setChecked(True)  # toggled -> _apply_mip_all
+        elif self.mip_checkbox.isChecked():
+            self._apply_mip_all(True)
 
     def _apply_mip_all(self, on: bool):
         for pane in self.panes:
-            if pane.mip_box is not None:
-                pane.mip_box.setChecked(on)
+            if pane.mip_box is None:
+                continue
+            if on:
+                pane.set_proj_method(self.proj_method)
+            else:
+                pane.mip_box.setChecked(False)
 
     # ---- minimalist mode -----------------------------------------------
 
@@ -781,7 +824,7 @@ class WorkspaceWindow(FileDropMixin, QMainWindow):
 
     def _montage_image(self, panes, scale=1, labels=True, t=None, z=None):
         """One montage frame: the given panes in grid order, each rendered at
-        full resolution with its current contrast/channels/MIP, labeled and
+        full resolution with its current contrast/channels/projection, labeled and
         letterboxed into equal cells. t/z override the position per axis."""
         from PIL import Image, ImageDraw, ImageFont
 

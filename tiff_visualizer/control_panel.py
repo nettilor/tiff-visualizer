@@ -6,6 +6,7 @@ active stack (last clicked). Closing it quits the app.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
 
 from PySide6.QtCore import Qt
@@ -30,15 +31,22 @@ from .viewer import FileDropMixin, StackPane, build_menus
 
 def _close_stack_by_path(path: Path):
     """Close every open pane showing this file, wherever it lives."""
-    for pane in list(viewer._all_panes):
-        if pane.stack.path == path:
-            ws = workspace._workspace
-            if ws is not None and pane in ws.panes:
-                ws.close_pane(pane)
-            else:
-                window = next((w for w in viewer._open_windows if w.pane is pane), None)
-                if window is not None:
-                    window.close()
+    _close_stacks_by_paths({path})
+
+
+def _close_stacks_by_paths(paths: set):
+    """Same, for many files at once: the grid tiles go in one batch so the
+    layout is rebuilt once instead of once per closed stack."""
+    targets = [p for p in list(viewer._all_panes) if p.stack.path in paths]
+    ws = workspace._workspace
+    tiled = [p for p in targets if ws is not None and p in ws.panes]
+    if tiled:
+        ws.close_panes(tiled)
+    for pane in targets:
+        if pane not in tiled:
+            window = next((w for w in viewer._open_windows if w.pane is pane), None)
+            if window is not None:
+                window.close()
 
 
 class FolderSection(QWidget):
@@ -49,7 +57,6 @@ class FolderSection(QWidget):
         super().__init__()
         self.path = path
         self.owner = owner
-        self._syncing = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 6, 0, 0)
@@ -95,9 +102,50 @@ class FolderSection(QWidget):
         # No height cap: the list stretches with the window, scrolls when short.
         layout.addWidget(self.scroll, 1)
 
-    def _on_toggled(self, file: Path, on: bool):
-        if self._syncing:
+        # Bulk actions under the list: check/uncheck every box in one pass.
+        actions = QHBoxLayout()
+        actions.setContentsMargins(8, 0, 0, 0)
+        actions.setSpacing(4)
+        self.open_all_button = QPushButton("Open all")
+        self.open_all_button.setToolTip(f"Open every stack in {path.name}")
+        self.close_all_button = QPushButton("Close all")
+        self.close_all_button.setToolTip(f"Close every open stack from {path.name}")
+        for b, slot in (
+            (self.open_all_button, self.open_all),
+            (self.close_all_button, self.close_all),
+        ):
+            b.setFocusPolicy(Qt.NoFocus)
+            b.clicked.connect(slot)
+            actions.addWidget(b)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+        self.sync(open_paths)
+
+    def open_all(self):
+        """Open every stack in this folder that isn't open yet."""
+        self._set_all(True)
+
+    def close_all(self):
+        """Close every pane showing a stack from this folder."""
+        self._set_all(False)
+
+    def _set_all(self, on: bool):
+        # One batched open/close for the whole folder, with the control
+        # window's own refreshes held off until it is done; the boxes then
+        # sync once from what is actually open.
+        files = [f for f, box in self.checks.items() if box.isChecked() != on]
+        if not files:
             return
+        with self.owner.bulk_update():
+            if on:
+                viewer.open_paths(files, self)
+            else:
+                _close_stacks_by_paths(set(files))
+        self.owner.statusBar().showMessage(
+            f"{'Opened' if on else 'Closed'} {len(files)} stacks · {self.path.name}", 4000
+        )
+
+    def _on_toggled(self, file: Path, on: bool):
         if on:
             viewer.open_path(file, self)
         else:
@@ -105,13 +153,22 @@ class FolderSection(QWidget):
         self.owner.refresh_state()
 
     def sync(self, open_paths: set):
-        """Reflect reality: stacks opened/closed elsewhere update the boxes."""
-        self._syncing = True
-        try:
-            for file, box in self.checks.items():
-                box.setChecked(file in open_paths)
-        finally:
-            self._syncing = False
+        """Reflect reality: stacks opened/closed elsewhere update the boxes.
+
+        Signals are blocked per box rather than muted with a flag: opening a
+        stack refreshes the control window, so this can run nested inside a
+        batch and must not re-enable the per-file handler behind its back.
+        """
+        n_open = 0
+        for file, box in self.checks.items():
+            is_open = file in open_paths
+            n_open += is_open
+            if box.isChecked() != is_open:
+                box.blockSignals(True)
+                box.setChecked(is_open)
+                box.blockSignals(False)
+        self.open_all_button.setEnabled(n_open < len(self.checks))
+        self.close_all_button.setEnabled(n_open > 0)
 
 _instance: "ControlWindow | None" = None
 
@@ -132,6 +189,11 @@ class ControlWindow(FileDropMixin, QMainWindow):
     def __init__(self):
         super().__init__()
         from . import __version__
+
+        # >0 while a bulk open/close runs: opening a stack refreshes this
+        # window, and refreshing it re-syncs every folder list, so a batch of
+        # 48 would otherwise do that work 48 times over.
+        self._suspend_refresh = 0
 
         self.setWindowTitle(f"TIFF Visualizer {__version__.rsplit('.', 1)[0]}")
         self._init_file_drops()
@@ -244,15 +306,15 @@ class ControlWindow(FileDropMixin, QMainWindow):
 
     def dropEvent(self, ev):
         handled = False
-        for directory in self._dropped_dirs(ev.mimeData()):
-            self.add_folder_section(directory)
-            handled = True
-        for path in self._dropped_tiff_paths(ev.mimeData()):
-            viewer.open_path(path, self)
-            handled = True
+        with self.bulk_update():
+            for directory in self._dropped_dirs(ev.mimeData()):
+                self.add_folder_section(directory)
+                handled = True
+            if paths := self._dropped_tiff_paths(ev.mimeData()):
+                viewer.open_paths(paths, self)
+                handled = True
         if handled:
             ev.acceptProposedAction()
-        self.refresh_state()
 
     def add_folder_section(self, path: Path):
         key = str(path.resolve())
@@ -312,7 +374,19 @@ class ControlWindow(FileDropMixin, QMainWindow):
     def _on_focus_changed(self, *_):
         self.refresh_state()
 
+    @contextmanager
+    def bulk_update(self):
+        """Hold off state refreshes until the whole batch is done."""
+        self._suspend_refresh += 1
+        try:
+            yield
+        finally:
+            self._suspend_refresh -= 1
+        self.refresh_state()
+
     def refresh_state(self):
+        if self._suspend_refresh:
+            return
         pane = self._pane()
         has_pane = pane is not None
         for b in (self.save_button, self.bc_button, self.project_button,

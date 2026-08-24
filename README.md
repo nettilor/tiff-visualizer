@@ -52,10 +52,10 @@ automatically** in Settings turns the daily look off. That check is the only
 network request the app ever makes.
 
 For the check to find a build, a release needs a downloadable asset whose name
-says which platform it is for — `TIFF-Visualizer-1.3.0-macos.dmg` (what
-`packaging/make_dmg.sh` writes) and `TIFF-Visualizer-1.3.0-windows.zip`. A
+says which platform it is for — `TIFF-Visualizer-1.3.1-macos.dmg` (what
+`packaging/make_dmg.sh` writes) and `TIFF-Visualizer-1.3.1-windows.zip`. A
 release with no matching asset still gets offered; the alert then just opens
-the release page. Tags must be plain `v1.3.0`-style versions: anything else is
+the release page. Tags must be plain `v1.3.1`-style versions: anything else is
 deliberately never offered (`tiff_visualizer/updater.py`).
 
 ## Setup
@@ -82,7 +82,8 @@ near-black chrome — chosen for microscopy work (`tiff_visualizer/theme.py`).
 Drop a **folder** onto the control window and it expands with a section: the
 folder's name (📁, ✕ to remove the section) and a checkbox per TIFF inside.
 **Checking opens the stack, unchecking closes it** — a fast way to swap
-between files. Checkboxes track reality (stacks closed elsewhere untick),
+between files. **Open all** / **Close all** under the list do the whole folder
+in one batch. Checkboxes track reality (stacks closed elsewhere untick),
 multiple folders can be dropped, and long lists scroll.
 
 ## Control window
@@ -109,7 +110,10 @@ shown at the bottom. Closing the control window quits the app.
 - **▶ on the z/t bars** plays through the dimension (right-click for 2–30 fps);
   **Space** toggles time playback (the shared bar in shared-axes grids; z for
   stacks with no time axis).
-- **MIP** checkbox: live maximum projection over z while scrubbing t.
+- **Z-projection** checkbox: a live projection over z while scrubbing t.
+  It is labeled with the active method (**MIP** for max, then MIN / AVG /
+  MED / SUM) — right-click it to switch between Max intensity, Min
+  intensity, Average, Median and Sum slices on the fly.
 - **Cmd+O** opens more stacks; **Cmd+Shift+O** opens a whole folder of TIFFs.
 - **Cmd+C / Cmd+E / Cmd+Shift+E**: copy view to clipboard / export PNG /
   export a t- or z-series as a GIF movie — full resolution, current contrast.
@@ -180,9 +184,10 @@ out — it never discards stacks.
 
 ### MIP all
 
-The **MIP all** checkbox in the grid controls max-projects every tile over z
-at once; tiles joining the grid adopt it, and individual tiles can still be
-toggled separately.
+The **MIP all** checkbox in the grid controls projects every tile over z at
+once; right-click it to pick the method for the whole grid (it is labeled
+**MIP all** / **AVG all** / … like the per-tile toggle). Tiles joining the
+grid adopt it, and individual tiles can still be toggled separately.
 
 ### Minimalist mode
 

@@ -104,32 +104,47 @@ class TiffStack:
     def plane(self, t: int, z: int, c: int) -> np.ndarray:
         return self.data[t, z, c]
 
-    def values_at(self, t: int, z: int, y: int, x: int, mip: bool = False) -> np.ndarray:
+    def values_at(
+        self, t: int, z: int, y: int, x: int, mip: bool = False, method: str = "Max"
+    ) -> np.ndarray:
         """Raw pixel values across channels at one position."""
         if mip:
-            return np.asarray(self.data[t, :, :, y, x]).max(axis=0)
+            return project_block(np.asarray(self.data[t, :, :, y, x]), method)
         return np.asarray(self.data[t, z, :, y, x])
 
     def render(
-        self, t: int, z: int, channels: Sequence[int], stride: int = 1, mip: bool = False
+        self,
+        t: int,
+        z: int,
+        channels: Sequence[int],
+        stride: int = 1,
+        mip: bool = False,
+        method: str = "Max",
     ) -> np.ndarray:
         """Render one displayed plane to RGB uint8 via display ranges + LUTs.
 
         stride > 1 renders every stride-th pixel — used when the pane shows
         the image small, so scrubbing many tiled stacks stays fast.
-        mip renders the maximum projection over z instead of one slice.
+        mip renders a projection over z (method, one of PROJECTION_METHODS)
+        instead of one slice.
         """
         h, w = self.shape_yx
         h = (h + stride - 1) // stride
         w = (w + stride - 1) // stride
         acc = np.zeros((h, w, 3), dtype=np.uint16)
         for ci in channels:
+            lo, hi = self.ranges[ci]
             if mip:
-                img = np.asarray(self.data[t, :, ci, ::stride, ::stride]).max(axis=0)
+                block = np.asarray(self.data[t, :, ci, ::stride, ::stride])
+                img = project_block(block, method)
+                if method == "Sum":
+                    # Sums leave the slice's value range, so the display
+                    # window grows with them: on screen a sum reads like the
+                    # mean while the probe still reports the true totals.
+                    lo, hi = lo * block.shape[0], hi * block.shape[0]
             else:
                 img = self.data[t, z, ci][::stride, ::stride]
-            lo, hi = self.ranges[ci]
-            if self.dtype == np.uint8 and lo == 0 and hi == 255:
+            if img.dtype == np.uint8 and lo == 0 and hi == 255:
                 idx = img
             else:
                 scaled = (img.astype(np.float32) - lo) * (255.0 / max(hi - lo, 1e-9))
@@ -243,6 +258,30 @@ def _load_ranges(ij: dict, data: np.ndarray) -> np.ndarray:
 
 PROJECTION_METHODS = ["Max", "Min", "Mean", "Median", "Sum"]
 _PROJ_PREFIX = {"Max": "MAX", "Min": "MIN", "Mean": "AVG", "Median": "MED", "Sum": "SUM"}
+# Short names for the live z-projection toggle; "Max" keeps its familiar MIP.
+PROJECTION_ABBREV = {"Max": "MIP", "Min": "MIN", "Mean": "AVG", "Median": "MED", "Sum": "SUM"}
+
+
+def project_block(block: np.ndarray, method: str) -> np.ndarray:
+    """Collapse block's leading axis by one of PROJECTION_METHODS.
+
+    Max/Min/Median keep the input dtype (Fiji's convention), Mean and Sum
+    promote to 32-bit float since their results leave it.
+    """
+    if method == "Max":
+        return block.max(axis=0)
+    if method == "Min":
+        return block.min(axis=0)
+    if method == "Mean":
+        return block.mean(axis=0, dtype=np.float64).astype(np.float32)
+    if method == "Median":
+        med = np.median(block, axis=0)
+        if np.issubdtype(block.dtype, np.integer):
+            return np.round(med).astype(block.dtype)
+        return med.astype(block.dtype)
+    if method == "Sum":
+        return block.sum(axis=0, dtype=np.float64).astype(np.float32)
+    raise ValueError(f"Unknown projection method {method!r}")
 
 
 def project(stack: TiffStack, axis: str, method: str, start: int, stop: int) -> TiffStack:
@@ -254,22 +293,7 @@ def project(stack: TiffStack, axis: str, method: str, start: int, stop: int) -> 
     """
     ax = {"T": 0, "Z": 1}[axis]
     sub = np.asarray(stack.data[start : stop + 1] if ax == 0 else stack.data[:, start : stop + 1])
-    if method == "Max":
-        arr = sub.max(axis=ax, keepdims=True)
-    elif method == "Min":
-        arr = sub.min(axis=ax, keepdims=True)
-    elif method == "Mean":
-        arr = sub.mean(axis=ax, keepdims=True, dtype=np.float64).astype(np.float32)
-    elif method == "Median":
-        arr = np.median(sub, axis=ax, keepdims=True)
-        if np.issubdtype(stack.dtype, np.integer):
-            arr = np.round(arr).astype(stack.dtype)
-        else:
-            arr = arr.astype(stack.dtype)
-    elif method == "Sum":
-        arr = sub.sum(axis=ax, keepdims=True, dtype=np.float64).astype(np.float32)
-    else:
-        raise ValueError(f"Unknown projection method {method!r}")
+    arr = np.expand_dims(project_block(np.moveaxis(sub, ax, 0), method), ax)
 
     if arr.dtype == stack.dtype:
         ranges = stack.ranges.copy()

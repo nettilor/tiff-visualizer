@@ -21,6 +21,10 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 TMP = tempfile.mkdtemp(prefix="tiffviz_test_")
+# Any stack in the folder will do for the single-stack checks that do not
+# depend on a particular file; the folder's contents change over time.
+STACKS = sorted(p for p in Path("example_stacks").iterdir() if p.suffix.lower() in (".tif", ".tiff"))
+SPARE_STACK = str(STACKS[-1])
 
 from tiff_visualizer import settings as app_settings  # noqa: E402
 
@@ -123,6 +127,31 @@ p1.mip_box.setChecked(True)
 assert "MIP" in p1.header_label.text() and not p1.bars["z"].isEnabled()
 p1.mip_box.setChecked(False)
 ok("channel boxes + MIP toggle")
+# Right-click menu on the projection box swaps method on the fly; picking one
+# while it is off also switches it on, and the label/header follow the method.
+assert "MIP" in p1.mip_box.text()
+menu = viewer.projection_menu(p1.mip_box, p1.proj_method, p1.set_proj_method)
+labels = [a.text() for a in menu.actions()]
+assert len(labels) == len(stack_io.PROJECTION_METHODS) and "Average (AVG)" in labels
+assert [a.isChecked() for a in menu.actions()] == [True, False, False, False, False]
+menu.actions()[2].trigger()  # Mean
+assert p1.mip_box.isChecked() and p1.proj_method == "Mean"
+assert "AVG" in p1.mip_box.text() and "z AVG" in p1.header_label.text()
+assert p1._export_name("png").endswith("_AVG.png")
+mean_rgb = p1._full_res_rgb()
+p1.set_proj_method("Max")
+assert not np.array_equal(mean_rgb, p1._full_res_rgb())  # cache keyed on method
+p1.set_proj_method("Sum")
+# Sum grows the display window with the slice count, so it reads like the mean
+# while the pixel probe reports true sums.
+assert np.abs(p1._full_res_rgb().astype(int) - mean_rgb.astype(int)).max() <= 2
+t_, z_, c_ = p1.position()
+sums = p1.stack.values_at(t_, z_, 5, 5, True, "Sum")
+means = p1.stack.values_at(t_, z_, 5, 5, True, "Mean")
+assert np.allclose(sums, means * p1.stack.n_slices, rtol=1e-4)
+p1.set_proj_method("Max")
+p1.mip_box.setChecked(False)
+ok("z-projection methods: menu, live swap, label/header/export naming")
 was_composite = p1._composite_on()
 p1.channel_boxes[3].setChecked(True)
 p1.composite_box.setChecked(True)
@@ -203,8 +232,18 @@ ws.shared_view_checkbox.setChecked(False)
 ok("shared view linking")
 ws.mip_checkbox.setChecked(True)
 assert all(p.mip_box.isChecked() for p in ws.panes)
+ws.set_proj_method("Median")
+assert all(p.proj_method == "Median" and p.mip_box.isChecked() for p in ws.panes)
+assert "MED all" in ws.mip_checkbox.text()
 ws.mip_checkbox.setChecked(False)
-ok("MIP all")
+assert not any(p.mip_box.isChecked() for p in ws.panes)
+ws.set_proj_method("Min")  # picking a method with the box off turns it back on
+assert ws.mip_checkbox.isChecked() and all(p.proj_method == "Min" for p in ws.panes)
+ws.mip_checkbox.setChecked(False)
+ws.set_proj_method("Max", False)
+for p in ws.panes:
+    p.set_proj_method("Max", False)
+ok("MIP all + projection method across the grid")
 ws.minimal_checkbox.setChecked(True)
 app.processEvents()
 assert ws.shared_checkbox.isChecked()
@@ -338,7 +377,9 @@ ws.minimal_checkbox.setChecked(True)
 app.processEvents()
 p1.bars["t"].set_value(3)
 p1.set_flagged(True)
+p1.set_proj_method("Median")
 data = session.capture()
+assert next(e for e in data["stacks"] if e["path"].endswith("XY05.tif"))["proj"] == "Median"
 assert data["workspace"]["minimalist"] is True
 grid_order = [q.stack.name for q in workspace.get_workspace().panes]
 assert [Path(e["path"]).name for e in data["stacks"]] == grid_order  # grid order kept
@@ -355,6 +396,10 @@ assert not restored.close_button.isVisibleTo(restored)  # minimalist applied
 ws = workspace.get_workspace()
 assert [q.stack.name for q in ws.panes] == grid_order
 assert restored.flagged and ws.flag_checkbox.isVisibleTo(ws)
+assert restored.proj_method == "Median" and restored.mip_box.isChecked()
+assert "MED" in restored.mip_box.text() and "z MED" in restored.header_label.text()
+restored.mip_box.setChecked(False)
+restored.set_proj_method("Max", False)
 ws.minimal_checkbox.setChecked(False)
 ok("session round-trip incl. minimalist, grid order and flags")
 session.close_all()
@@ -370,16 +415,41 @@ mime.setUrls([QUrl.fromLocalFile(str(folder))])
 ctrl.dropEvent(FakeDrop(mime))
 app.processEvents()
 section = next(iter(ctrl.folder_sections.values()))
-assert len(section.checks) == 48
+n_tiffs = len([f for f in folder.iterdir() if f.suffix.lower() in (".tif", ".tiff")])
+assert len(section.checks) == n_tiffs
 box = section.checks[folder / "XY10.tif"]
 box.setChecked(True)
 app.processEvents()
 assert any(p.stack.name == "XY10.tif" for p in viewer._all_panes)
+assert section.open_all_button.isEnabled() and section.close_all_button.isEnabled()
 box.setChecked(False)
 app.processEvents()
 assert not viewer._all_panes
+assert not section.close_all_button.isEnabled()  # nothing open to close
 ctrl.remove_folder_section(section)
 ok("folder swap list open/close")
+
+ctrl.dropEvent(FakeDrop(mime))
+app.processEvents()
+section = next(iter(ctrl.folder_sections.values()))
+# Open all with the grid active: adding a tile refreshes the control window,
+# which re-syncs this list mid-batch — that must not re-fire the per-file
+# handler and open every stack a second time.
+section.checks[sorted(section.checks)[0]].setChecked(True)
+app.processEvents()
+workspace.combine_all()
+app.processEvents()
+section.open_all()
+app.processEvents()
+assert len(viewer._all_panes) == n_tiffs, len(viewer._all_panes)  # no duplicates
+assert all(b.isChecked() for b in section.checks.values())
+assert not section.open_all_button.isEnabled()  # everything is open already
+section.close_all()  # closing must reach panes tiled in the grid too
+app.processEvents()
+assert not viewer._all_panes and not any(b.isChecked() for b in section.checks.values())
+assert section.open_all_button.isEnabled() and not section.close_all_button.isEnabled()
+ctrl.remove_folder_section(section)
+ok("folder list open all / close all")
 
 # A tall saved geometry (window stretched for folder lists) must not carry
 # over to a fresh start, where no folder sections exist yet.
@@ -399,7 +469,7 @@ ok("control window height compacts on startup")
 print("preload")
 app_settings.settings().setValue("preload/enabled", True)
 app_settings.settings().setValue("preload/gb", 4)
-p = workspace.show_stack(stack_io.load_stack("example_stacks/XY11.tif"))
+p = workspace.show_stack(stack_io.load_stack(SPARE_STACK))
 assert wait_until(lambda: p.stack.in_memory), "preload did not complete"
 ok("RAM preload within budget")
 app_settings.settings().setValue("preload/enabled", False)
