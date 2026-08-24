@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.3.0 — 2026-08-24
+
+### Export
+- **Montage grid layout**: Export Stack Montage gains a Layout choice for a
+  single varying axis (t, z, or t with z collapsed to a MIP) — Auto grid
+  (near-square, as before), One row, One column, or Custom columns × rows.
+  The grid boxes always show the effective grid and unlock in Custom, where
+  editing one dimension only grows the other when the typed grid would drop
+  tiles; oversized grids leave black cells, and the size estimate says how
+  many are empty. With both t and z varying the sheet stays t across × z
+  down.
+- **Dialogs remember their last-used options**: Export Stack Montage, Export
+  Grid Montage, Export Movie and Projection reopen exactly as last accepted
+  (Cancel changes nothing), so repeating an export across positions is just
+  OK, OK, OK. Choices a stack doesn't offer are skipped and values clamp to
+  its range; a stack lacking an axis never overwrites the remembered setting
+  for it; a projection range is remembered only when it was narrowed, so a
+  full range stays full on a taller stack.
+
+### App
+- Regression suite: 37 checks.
+
 ## 1.2.0 — 2026-08-17
 
 First public release on GitHub.

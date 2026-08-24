@@ -2,7 +2,7 @@
 For all features ask the user before implementing if they will not be practical!
 At each version bump, completed items are rolled up into CHANGELOG.md (grouped by area, per release); this file stays the working tracker.
 
-Current released version: **1.2.0** (see CHANGELOG.md)
+Current released version: **1.3.0** (see CHANGELOG.md)
 
 ### To implement
 
@@ -22,6 +22,8 @@ Current released version: **1.2.0** (see CHANGELOG.md)
 ### To fix
 
 ### Completed
+- [x] Export/projection dialogs remember their last-used options (Export Stack Montage, Export Grid Montage, Export Movie and Projection reopen exactly as last accepted — Cancel changes nothing; choices a stack doesn't offer are skipped and spin values clamp to its range; a t-less or z-less stack never overwrites the remembered step for the axis it lacks; the custom montage grid is kept from the last time Custom was actually used; a pane with MIP on still preselects the MIP export; a projection range is remembered only when it was narrowed, so a full range stays full on taller stacks; stored under dialogs/* in QSettings via settings.restore_widgets/save_widgets)
+- [x] Stack montage grid layout (Layout combo in Export Stack Montage for a single varying axis — t, z, or t with z collapsed to MIP: Auto grid (near-square, the old default) / One row / One column / Custom columns × rows; the cols × rows boxes always show the effective grid and unlock in Custom, where editing one dimension grows the other only when the typed grid would drop tiles, so oversized grids simply leave black cells and the size estimate reports how many are empty; when both t and z vary the sheet stays t across × z down and the layout controls are disabled)
 - [x] Update checking from GitHub (tiff_visualizer/updater.py, ported from pLayout's UpdateChecker: looks at nettilor/tiff-visualizer's releases/latest at most once a day, silent when up to date and silent offline; File > Check for Updates… — the app menu on macOS — always answers, including "didn't reach GitHub"; an offer shows the release notes excerpt with Download & Open / Not Now / Skip This Version, downloads the platform's asset into ~/Downloads with a cancelable progress dialog and opens it to drag into Applications; malformed tags and foreign-platform assets are never offered; auto-check toggle in Settings; policy functions covered by the regression suite without a network)
 - [x] Number-key channel switching (1–9 on the active stack: in Composite each digit toggles that channel's visibility, otherwise it jumps the c bar to that channel; syncs with the pane's numbered boxes, the B&C panels and shared-channels mode; digits past the stack's channel count are left unhandled. Plain digits chosen over Cmd+1 — that's already View → Actual Size)
 - [x] B&C channel radios could not switch channel in shared-axes grid mode (clicking "Ch 2" wrote to the pane's own hidden c bar, which `_sync_shared` immediately snapped back, so the only way to adjust another channel's contrast was dragging the shared slider; `set_channel` now drives the shared c bar like the arrow keys do, while locked tiles keep steering their own)

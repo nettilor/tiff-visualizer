@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from . import settings as app_settings
 from . import viewer
 from .stack_io import TiffStack
 from .viewer import DimBar, FileDropMixin, StackPane, StackWindow, build_menus
@@ -230,6 +231,19 @@ class MontageDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         form.addRow(buttons)
+        # Mode first so its GIF half-size default is overridden by the
+        # remembered resolution rather than the other way round.
+        self._remembered = {
+            "mode": self.mode_combo,
+            "fps": self.fps_spin,
+            "scale": self.scale_combo,
+            "labels": self.labels_box,
+        }
+        app_settings.restore_widgets("gridMontage", self._remembered)
+
+    def accept(self):
+        app_settings.save_widgets("gridMontage", self._remembered)
+        super().accept()
 
     def _on_mode(self, *_):
         is_gif = self.mode_combo.currentData()[0] == "gif"

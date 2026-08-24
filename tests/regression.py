@@ -430,7 +430,108 @@ assert wrap.size == (2 * 480, 2 * 360)
 mip_sheet = np.asarray(p._stack_montage_image([0, 1], [0], [1], 4, False, mip=True))
 flat_sheet = np.asarray(p._stack_montage_image([0, 1], [0], [1], 4, False, mip=False))
 assert (mip_sheet >= flat_sheet).all() and mip_sheet.sum() > flat_sheet.sum()
-ok("stack montage: t×z sheet, wrapped axis, MIP option")
+# Explicit layouts for a single varying axis: one row, one column, and a
+# custom grid that grows rows so every tile fits (surplus cells stay black).
+row = p._stack_montage_image([0, 1, 2, 3], [0], [0], 2, True, grid=(4, 1))
+assert row.size == (4 * 480, 360)
+col = p._stack_montage_image([0, 1, 2, 3], [0], [0], 2, True, grid=(1, 4))
+assert col.size == (480, 4 * 360)
+custom = np.asarray(p._stack_montage_image([0, 1, 2, 3], [0], [0], 2, True, grid=(3, 1)))
+assert custom.shape[:2] == (2 * 360, 3 * 480)
+assert custom[360:, 480:].max() == 0 and custom[360:, :480].max() > 0
+assert viewer._montage_grid(8) == (3, 3) and viewer._montage_grid(8, (5, 5)) == (5, 5)
+ok("stack montage: t×z sheet, wrapped axis, MIP option, row/column/custom grids")
+
+# Montage dialog: the layout applies only while a single axis varies; the
+# grid boxes show the effective grid and are editable in Custom, where the
+# other dimension grows only when the typed one would drop tiles.
+d = viewer.StackMontageDialog(p)
+assert not d.layout_combo.isEnabled() and d.values()[6] is None  # t×z is fixed
+d.z_combo.setCurrentIndex(1)  # MIP collapses z -> only t varies (8 tiles)
+assert d.layout_combo.isEnabled() and d._grid() == (3, 3, False)
+assert d.values()[6] is None and d.estimate.text().endswith("1 empty")
+d.layout_combo.setCurrentIndex(1)  # one row
+assert d.values()[6] == (8, 1) and not d.cols_spin.isEnabled()
+d.layout_combo.setCurrentIndex(2)  # one column
+assert d.values()[6] == (1, 8)
+d.layout_combo.setCurrentIndex(3)  # custom
+assert d.cols_spin.isEnabled() and d.rows_spin.isEnabled()
+d.cols_spin.setValue(4)  # 4×8 still fits everything -> rows kept
+assert d.values()[6] == (4, 8)
+d.rows_spin.setValue(1)  # 4×1 would drop tiles -> cols grows to 8
+assert d.values()[6] == (8, 1)
+d.cols_spin.setValue(3)  # 3×1 -> rows grows to 3
+assert d.values()[6] == (3, 3) and "empty" in d.estimate.text()
+d.t_spin.setValue(3)  # every 3rd t -> 3 tiles in a 3×3 grid, 6 empty
+assert d.values()[6] == (3, 3) and d.estimate.text().endswith("6 empty")
+d.z_combo.setCurrentIndex(0)  # back to t×z -> layout ignored again
+assert d.values()[6] is None and not d.cols_spin.isEnabled()
+d.deleteLater()
+ok("stack montage dialog: layout modes, linked grid boxes, t×z lockout")
+
+# Dialogs reopen with the options last accepted; Cancel forgets nothing.
+d = viewer.StackMontageDialog(p)
+d.z_combo.setCurrentIndex(1)  # MIP -> t only, every 2nd t = 4 tiles
+d.t_spin.setValue(2)
+d.layout_combo.setCurrentIndex(3)
+d.cols_spin.setValue(4)
+d.rows_spin.setValue(1)
+d.scale_combo.setCurrentIndex(2)
+d.labels_box.setChecked(False)
+d.accept()
+d = viewer.StackMontageDialog(p)
+assert d.values() == (2, 1, True, 4, False, False, (4, 1)), d.values()
+d.scale_combo.setCurrentIndex(0)
+d.reject()
+assert viewer.StackMontageDialog(p).values()[3] == 4  # Cancel did not save
+# A pane whose MIP is on preselects the MIP export over a remembered "all slices".
+d = viewer.StackMontageDialog(p)
+d.z_combo.setCurrentIndex(0)
+d.accept()
+assert viewer.StackMontageDialog(p).values()[2] is False
+p.mip_box.setChecked(True)
+assert viewer.StackMontageDialog(p).values()[2] is True
+p.mip_box.setChecked(False)
+# Movie: axis + fps.
+d = viewer.ExportMovieDialog(p)
+d.axis_combo.setCurrentText("Z")
+d.fps_spin.setValue(25)
+d.accept()
+assert viewer.ExportMovieDialog(p).values() == ("Z", 25)
+p.mip_box.setChecked(True)  # MIP hides Z: a forced single-entry axis is no choice
+d = viewer.ExportMovieDialog(p)
+assert d.axis_combo.count() == 1
+d.accept()
+p.mip_box.setChecked(False)
+assert viewer.ExportMovieDialog(p).values() == ("Z", 25)
+# Grid montage: the remembered resolution beats the GIF half-size default.
+d = workspace.MontageDialog(None, [p])
+d.mode_combo.setCurrentIndex(1)  # movie over t -> scale bumps to Half
+assert d.scale_combo.currentData() == 2
+d.scale_combo.setCurrentIndex(0)
+d.fps_spin.setValue(7)
+d.labels_box.setChecked(False)
+d.accept()
+assert workspace.MontageDialog(None, [p]).values() == ("gif", "T", 7, 1, False)
+# Projection: axis + method, and the slice range only when it was narrowed.
+d = viewer.ProjectionDialog(p)
+d.method_combo.setCurrentText("Sum")
+d.start_spin.setValue(3)
+d.stop_spin.setValue(5)
+d.accept()
+d = viewer.ProjectionDialog(p)
+assert d.values() == ("Z", "Sum", 2, 4)
+d.start_spin.setValue(1)
+d.stop_spin.setValue(9)  # full range again
+d.accept()
+assert app_settings.settings().value("dialogs/projection/range") == "full"
+d = viewer.ProjectionDialog(p)
+assert d.values() == ("Z", "Sum", 0, 8)
+d.axis_combo.setCurrentText("T")
+d.stop_spin.setValue(50)  # clamps to the 8 frames
+d.accept()
+assert viewer.ProjectionDialog(p).values() == ("T", "Sum", 0, 7)
+ok("dialogs remember last accepted options (montage, grid montage, movie, projection)")
 
 print("updates")
 from datetime import datetime, timedelta  # noqa: E402

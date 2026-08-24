@@ -1078,11 +1078,12 @@ class StackPane(QWidget):
     # ---- stack montage (t across, z down) ------------------------------
 
     def _stack_montage_image(
-        self, t_idx, z_idx, channels, stride, labels, mip=False, on_tile=None
+        self, t_idx, z_idx, channels, stride, labels, mip=False, on_tile=None, grid=None
     ):
         """One montage sheet of this stack: t across columns, z down rows;
-        a single varying axis wraps into a near-square grid instead. Returns
-        a PIL image, or None if on_tile() reported a cancel."""
+        a single varying axis wraps into a near-square grid instead, or into
+        the (cols, rows) ``grid`` when given (row-major; surplus cells stay
+        black). Returns a PIL image, or None if on_tile() reported a cancel."""
         from PIL import Image, ImageDraw, ImageFont
 
         s = self.stack
@@ -1095,8 +1096,7 @@ class StackPane(QWidget):
         else:
             over_t = len(t_idx) > 1
             seq = t_idx if over_t else z_idx
-            cols = math.ceil(math.sqrt(len(seq)))
-            rows = math.ceil(len(seq) / cols)
+            cols, rows = _montage_grid(len(seq), grid)
             letter = "t" if over_t else "z"
             cells = [
                 (
@@ -1151,7 +1151,7 @@ class StackPane(QWidget):
         dialog = StackMontageDialog(self)
         if dialog.exec() != QDialog.Accepted:
             return
-        t_step, z_step, mip, stride, per_channel, labels = dialog.values()
+        t_step, z_step, mip, stride, per_channel, labels, grid = dialog.values()
         t0, z0, _c0 = self.position()
         t_idx = list(range(0, s.n_frames, t_step)) if s.n_frames > 1 else [t0]
         z_idx = list(range(0, s.n_slices, z_step)) if s.n_slices > 1 and not mip else [z0]
@@ -1182,7 +1182,9 @@ class StackPane(QWidget):
 
         written = []
         for i, channels in enumerate(channel_sets):
-            img = self._stack_montage_image(t_idx, z_idx, channels, stride, labels, mip, tick)
+            img = self._stack_montage_image(
+                t_idx, z_idx, channels, stride, labels, mip, tick, grid
+            )
             if img is None:  # canceled
                 return
             out = Path(path)
@@ -1197,8 +1199,25 @@ class StackPane(QWidget):
         )
 
 
+def _montage_grid(n: int, grid=None) -> tuple[int, int]:
+    """(cols, rows) for n tiles laid out row-major: near-square by default,
+    or the requested grid grown just enough (extra rows) to hold every tile."""
+    if grid is None:
+        cols = math.ceil(math.sqrt(n))
+        return cols, math.ceil(n / cols)
+    cols = max(1, int(grid[0]))
+    return cols, max(1, int(grid[1]), math.ceil(n / cols))
+
+
 class StackMontageDialog(QDialog):
     """Options for Image > Export Stack Montage."""
+
+    LAYOUTS = (
+        ("Auto grid (near-square)", "auto"),
+        ("One row", "row"),
+        ("One column", "column"),
+        ("Custom columns × rows", "custom"),
+    )
 
     def __init__(self, pane: "StackPane"):
         super().__init__(pane.window())
@@ -1220,6 +1239,26 @@ class StackMontageDialog(QDialog):
         if s.n_slices > 1:
             form.addRow("z:", self.z_combo)
             form.addRow("Every nth z:", self.z_spin)
+        # Layout applies when a single axis varies (t, z, or t with z
+        # collapsed to a MIP); with both varying the sheet is always t
+        # across × z down. The spinboxes always show the effective grid and
+        # are editable only for the custom layout.
+        self.layout_combo = QComboBox()
+        for label, key in self.LAYOUTS:
+            self.layout_combo.addItem(label, key)
+        form.addRow("Layout:", self.layout_combo)
+        self.cols_spin = QSpinBox()
+        self.rows_spin = QSpinBox()
+        grid_row = QWidget()
+        grid_layout = QHBoxLayout(grid_row)
+        grid_layout.setContentsMargins(0, 0, 0, 0)
+        grid_layout.addWidget(self.cols_spin)
+        grid_layout.addWidget(QLabel("×"))
+        grid_layout.addWidget(self.rows_spin)
+        grid_layout.addWidget(QLabel("columns × rows"))
+        grid_layout.addStretch()
+        form.addRow("Grid:", grid_row)
+        self._syncing = False
         self.scale_combo = QComboBox()
         for label, factor in (("Full", 1), ("Half", 2), ("Quarter", 4)):
             self.scale_combo.addItem(label, factor)
@@ -1240,36 +1279,124 @@ class StackMontageDialog(QDialog):
             self.t_spin.valueChanged,
             self.z_spin.valueChanged,
             self.z_combo.currentIndexChanged,
+            self.layout_combo.currentIndexChanged,
             self.scale_combo.currentIndexChanged,
         ):
             signal.connect(self._update_estimate)
+        self.cols_spin.valueChanged.connect(
+            lambda _v: self._grid_edited(self.cols_spin, self.rows_spin)
+        )
+        self.rows_spin.valueChanged.connect(
+            lambda _v: self._grid_edited(self.rows_spin, self.cols_spin)
+        )
         self._update_estimate()
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         form.addRow(buttons)
+        # Reopen with the last accepted options; a pane whose MIP is on
+        # still preselects the MIP export since that's what's on screen.
+        app_settings.restore_widgets("stackMontage", self._remembered())
+        if pane._mip_on():
+            self.z_combo.setCurrentIndex(1)
+
+    def _remembered(self) -> dict[str, QWidget]:
+        """The options carried from one export to the next: only those this
+        stack lets the user choose (a t-less stack must not reset the t
+        step). Restore order matters: the layout comes before the grid boxes
+        it unlocks."""
+        s = self.pane.stack
+        widgets: dict[str, QWidget] = {}
+        if s.n_frames > 1:
+            widgets["tStep"] = self.t_spin
+        if s.n_slices > 1:
+            widgets["z"] = self.z_combo
+            widgets["zStep"] = self.z_spin
+        widgets["layout"] = self.layout_combo
+        widgets["cols"] = self.cols_spin
+        widgets["rows"] = self.rows_spin
+        widgets["scale"] = self.scale_combo
+        if self.channels_combo is not None:
+            widgets["channels"] = self.channels_combo
+        widgets["labels"] = self.labels_box
+        return widgets
+
+    def accept(self):
+        widgets = self._remembered()
+        if not self.cols_spin.isEnabled():  # keep the last *custom* grid
+            del widgets["cols"], widgets["rows"]
+        app_settings.save_widgets("stackMontage", widgets)
+        super().accept()
+
+    def _counts(self) -> tuple[int, int]:
+        """(nt, nz): tiles along each axis for the current options."""
+        s = self.pane.stack
+        mip = self.z_combo.currentData()
+        nt = len(range(0, s.n_frames, self.t_spin.value())) if s.n_frames > 1 else 1
+        nz = len(range(0, s.n_slices, self.z_spin.value())) if s.n_slices > 1 and not mip else 1
+        return nt, nz
+
+    def _grid_edited(self, edited: QSpinBox, other: QSpinBox):
+        """Custom grid: never lose a tile — grow the other dimension when the
+        edited one leaves too few cells, otherwise keep both as typed."""
+        if self._syncing:
+            return
+        nt, nz = self._counts()
+        n = max(nt, nz)
+        if edited.value() * other.value() < n:
+            self._syncing = True
+            other.setValue(math.ceil(n / edited.value()))
+            self._syncing = False
+        self._update_estimate()
+
+    def _grid(self) -> tuple[int, int, bool]:
+        """(cols, rows, both): the sheet's grid for the current options and
+        whether it is the fixed t×z layout."""
+        nt, nz = self._counts()
+        both = nt > 1 and nz > 1
+        n = max(nt, nz)
+        mode = self.layout_combo.currentData()
+        if both:
+            return nt, nz, True
+        if mode == "row":
+            return n, 1, False
+        if mode == "column":
+            return 1, n, False
+        if mode == "custom":
+            wanted = (min(self.cols_spin.value(), n), min(self.rows_spin.value(), n))
+            return (*_montage_grid(n, wanted), False)
+        return (*_montage_grid(n), False)
 
     def _update_estimate(self, *_):
         s = self.pane.stack
         mip = self.z_combo.currentData()
         self.z_spin.setEnabled(not mip)
-        nt = len(range(0, s.n_frames, self.t_spin.value())) if s.n_frames > 1 else 1
-        nz = len(range(0, s.n_slices, self.z_spin.value())) if s.n_slices > 1 and not mip else 1
+        cols, rows, both = self._grid()
+        n = max(self._counts())
+        self.layout_combo.setEnabled(not both)
+        custom = not both and self.layout_combo.currentData() == "custom"
+        self.cols_spin.setEnabled(custom)
+        self.rows_spin.setEnabled(custom)
+        self._syncing = True
+        for spin, value in ((self.cols_spin, cols), (self.rows_spin, rows)):
+            spin.setRange(1, max(n, value))
+            spin.setValue(value)
+        self._syncing = False
         stride = self.scale_combo.currentData()
         h, w = s.shape_yx
         cell_w, cell_h = len(range(0, w, stride)), len(range(0, h, stride))
-        if nt > 1 and nz > 1:
-            cols, rows = nt, nz
-        else:
-            n = max(nt, nz)
-            cols = math.ceil(math.sqrt(n))
-            rows = math.ceil(n / cols)
-        self.estimate.setText(f"{cols}×{rows} tiles · ≈{cols * cell_w}×{rows * cell_h} px")
+        text = f"{cols}×{rows} tiles · ≈{cols * cell_w}×{rows * cell_h} px"
+        empty = cols * rows - n
+        if not both and empty > 0:
+            text += f" · {empty} empty"
+        self.estimate.setText(text)
 
-    def values(self) -> tuple[int, int, bool, int, bool, bool]:
+    def values(self) -> tuple[int, int, bool, int, bool, bool, tuple[int, int] | None]:
         per_channel = (
             self.channels_combo.currentData() if self.channels_combo is not None else False
         )
+        cols, rows, both = self._grid()
+        grid = None if both or self.layout_combo.currentData() == "auto" else (cols, rows)
         return (
             self.t_spin.value(),
             self.z_spin.value(),
@@ -1277,6 +1404,7 @@ class StackMontageDialog(QDialog):
             self.scale_combo.currentData(),
             bool(per_channel),
             self.labels_box.isChecked(),
+            grid,
         )
 
 
@@ -1299,6 +1427,12 @@ class ExportMovieDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         form.addRow(buttons)
+        self._remembered = {"axis": self.axis_combo, "fps": self.fps_spin}
+        app_settings.restore_widgets("movie", self._remembered)
+
+    def accept(self):
+        app_settings.save_widgets("movie", self._remembered)
+        super().accept()
 
     def values(self) -> tuple[str, int]:
         return self.axis_combo.currentText(), self.fps_spin.value()
@@ -1524,13 +1658,32 @@ class ProjectionDialog(QDialog):
 
         self.axis_combo.currentTextChanged.connect(self._update_range)
         self._update_range()
+        self._remembered = {"axis": self.axis_combo, "method": self.method_combo}
+        app_settings.restore_widgets("projection", self._remembered)
+        saved = app_settings.settings().value("dialogs/projection/range", "", type=str)
+        if "-" in saved:  # "start-stop", 1-based; the spins clamp to this axis
+            start, stop = (int(v) for v in saved.split("-", 1))
+            self.start_spin.setValue(start)
+            self.stop_spin.setValue(stop)
 
-    def _update_range(self, *_):
-        count = (
+    def _axis_count(self) -> int:
+        return (
             self._stack.n_slices
             if self.axis_combo.currentText() == "Z"
             else self._stack.n_frames
         )
+
+    def accept(self):
+        app_settings.save_widgets("projection", self._remembered)
+        start, stop = sorted((self.start_spin.value(), self.stop_spin.value()))
+        narrowed = (start, stop) != (1, self._axis_count())
+        app_settings.settings().setValue(
+            "dialogs/projection/range", f"{start}-{stop}" if narrowed else "full"
+        )
+        super().accept()
+
+    def _update_range(self, *_):
+        count = self._axis_count()
         for spin in (self.start_spin, self.stop_spin):
             spin.setRange(1, count)
         self.start_spin.setValue(1)
