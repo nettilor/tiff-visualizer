@@ -2,7 +2,7 @@
 For all features ask the user before implementing if they will not be practical!
 At each version bump, completed items are rolled up into CHANGELOG.md (grouped by area, per release); this file stays the working tracker.
 
-Current released version: **1.3.1** (see CHANGELOG.md)
+Current released version: **1.4.0** (see CHANGELOG.md)
 
 ### To implement
 

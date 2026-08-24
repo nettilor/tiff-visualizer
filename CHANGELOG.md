@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.3.1 — 2026-08-24
+## 1.4.0 — 2026-08-24
 
 ### Viewing
 - **Z-projection type on the fly**: the per-pane projection checkbox is
