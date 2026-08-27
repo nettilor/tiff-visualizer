@@ -466,6 +466,27 @@ fresh.deleteLater()
 app.processEvents()
 ok("control window height compacts on startup")
 
+# Dock-icon clicks: macOS reports the reopen as a *second* Active state with no
+# Inactive in between (the plain activation, then Qt's forced one from
+# applicationShouldHandleReopen:), so only those raise the control window —
+# cmd-tab and clicking a stack window report Active once and must leave the
+# window order alone.
+from tiff_visualizer.__main__ import ReopenDetector  # noqa: E402
+
+d = ReopenDetector()
+assert not d.saw_state(True)  # launch
+assert d.saw_state(True)  # dock click while the app is already frontmost
+assert not d.saw_state(False)  # user switches away
+assert not d.saw_state(True)  # cmd-tab back / click on a stack window
+assert d.saw_state(True)  # dock click from the background: activation + forced repeat
+assert not d.saw_state(False) and not d.saw_state(True)
+ctrl.showMinimized()
+app.processEvents()
+control_panel.bring_to_front()
+app.processEvents()
+assert ctrl.isVisible() and not ctrl.isMinimized()
+ok("dock-icon reopen detection + control window raise")
+
 print("preload")
 app_settings.settings().setValue("preload/enabled", True)
 app_settings.settings().setValue("preload/gb", 4)

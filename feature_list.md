@@ -2,7 +2,8 @@
 For all features ask the user before implementing if they will not be practical!
 At each version bump, completed items are rolled up into CHANGELOG.md (grouped by area, per release); this file stays the working tracker.
 
-Current released version: **1.4.0** (see CHANGELOG.md)
+Current released version: **1.4.0** (see CHANGELOG.md); completed items not yet in
+the changelog are queued for **1.5.0**.
 
 ### To implement
 
@@ -22,6 +23,7 @@ Current released version: **1.4.0** (see CHANGELOG.md)
 ### To fix
 
 ### Completed
+- [x] Dock icon brings the main window to the front (clicking the app's dock icon raises the control window above the stack and grid windows and gives it focus, un-minimizing it first if needed — macOS only guarantees the *app* comes forward, so the control window used to stay buried under the stacks. Only real dock clicks do it: macOS answers one with a reopen that Qt reports as a second "app active" with no deactivation in between, so cmd-tab or clicking a stack window still leaves the window order alone)
 - [x] Open all / Close all in dropped-folder lists (two buttons under each folder section's file list: Open all opens every stack in the folder that isn't open yet, Close all closes every pane showing one of them — including tiles inside the grid; each button greys out when it has nothing to do and the status bar reports "Opened/Closed n stacks". Both run as one batch: viewer.open_paths() loads the memory-mappable stacks and hands them to the grid in a single add_panes(), WorkspaceWindow.close_panes() detaches many tiles with one relayout, and the control window suspends its own refreshes for the duration — ~7x faster at 11 stacks and more beyond, since a per-stack relayout is O(n²). Open folder…, multi-file Open… and file drops go through the same batched path)
 - [x] Z-projection type on the fly (the pane's projection checkbox is labeled with the live method — MIP / MIN / AVG / MED / SUM plus a ▾ caret — and right-clicking it offers Fiji's five methods (Max intensity, Min intensity, Average, Median, Sum slices); picking one also switches the projection on. The header reads "z AVG", PNG/GIF exports are named _AVG/_MED/…, the stack montage's collapse option follows the pane's method, and the workspace's "MIP all" gained the same right-click menu, applying the chosen method to every tile. Sum scales its display window by the slice count so it reads like the mean on screen while the pixel probe reports the true sums; the method is saved in sessions)
 - [x] Export/projection dialogs remember their last-used options (Export Stack Montage, Export Grid Montage, Export Movie and Projection reopen exactly as last accepted — Cancel changes nothing; choices a stack doesn't offer are skipped and spin values clamp to its range; a t-less or z-less stack never overwrites the remembered step for the axis it lacks; the custom montage grid is kept from the last time Custom was actually used; a pane with MIP on still preselects the MIP export; a projection range is remembered only when it was narrowed, so a full range stays full on taller stacks; stored under dialogs/* in QSettings via settings.restore_widgets/save_widgets)

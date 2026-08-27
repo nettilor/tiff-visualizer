@@ -1,4 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
+# NOTE: the shipped macOS build uses packaging/tiffviz_macos.spec.
+
+from PyInstaller.utils.hooks import collect_submodules
 
 
 a = Analysis(
@@ -6,7 +9,7 @@ a = Analysis(
     pathex=['.'],
     binaries=[],
     datas=[('tiff_visualizer/assets', 'tiff_visualizer/assets')],
-    hiddenimports=[],
+    hiddenimports=collect_submodules("imagecodecs"),
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

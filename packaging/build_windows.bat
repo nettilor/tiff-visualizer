@@ -17,10 +17,14 @@ if not exist packaging\icon.ico (
     call .venv-win\Scripts\python packaging\make_icon.py || goto :error
 )
 
+REM --collect-submodules imagecodecs: imagecodecs imports its ~70 codec
+REM extension modules dynamically via importlib, so PyInstaller finds none of
+REM them on its own and LZW/Deflate-compressed TIFFs fail to open.
 call .venv-win\Scripts\pyinstaller --noconfirm --clean --windowed ^
     --name "TIFF Visualizer" ^
     --icon packaging\icon.ico ^
     --paths . ^
+    --collect-submodules imagecodecs ^
     --add-data "tiff_visualizer\assets;tiff_visualizer\assets" ^
     packaging\launcher.py || goto :error
 

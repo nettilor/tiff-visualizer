@@ -185,6 +185,22 @@ def refresh_state():
         _instance.refresh_state()
 
 
+def bring_to_front():
+    """Raise the control window above the app's own stack windows and focus it.
+
+    Clicking the dock icon only brings the *app* forward: within it the stack
+    windows keep whatever order they had, so the control window stays buried
+    under them. This puts it back on top, un-minimizing it if needed.
+    """
+    if _instance is None:
+        return
+    if _instance.isMinimized():
+        _instance.setWindowState(_instance.windowState() & ~Qt.WindowMinimized)
+    _instance.show()
+    _instance.raise_()
+    _instance.activateWindow()
+
+
 class ControlWindow(FileDropMixin, QMainWindow):
     def __init__(self):
         super().__init__()
