@@ -1,5 +1,52 @@
 # Changelog
 
+## 1.5.0 — 2026-09-06
+
+### Measurements
+- **Measure (Cmd+M)**, Fiji's Analyze → Measure: the active stack's current
+  channel at its current z/t position — the projected plane when the pane's
+  z projection is on — measured inside its selection, or over the whole
+  image without one. Works on floating windows and on the active grid tile
+  alike, shared axes included; the host window's status bar shows the values.
+- **Measurements table** (Analyze → Measurements Table): one row per Cmd+M
+  with stack, c/z/t, ROI (shape plus bounding box, e.g. `rect 120,80 64×64`
+  or `whole image`), Area, Mean (MFI), Min and Max — whole numbers plain,
+  everything else with three decimals like Fiji. Pops up on the first
+  measurement without stealing focus. Copy (Cmd+C) puts the selected rows,
+  or all rows when none are selected, on the clipboard tab-separated with a
+  header line for spreadsheets; Save As… writes a CSV; Delete removes the
+  selected rows; Clear (or Analyze → Clear Measurements) empties it.
+
+### Selections
+- **Rectangle, ellipse, polygon and freehand selections**, Fiji-style: one
+  app-wide tool, picked from the new tool row in the control window,
+  Analyze → Selection Tool, or the keys H / R / E / P / D. The Hand pans;
+  with a shape tool a left drag draws — rectangle and ellipse drag out a
+  whole-pixel box clipped to the image, freehand traces an outline, polygon
+  takes a click per corner and closes on a double-click or a click on the
+  first corner. The probe row shows the shape and size while drawing.
+- Each stack keeps one selection in Fiji yellow: drawing a new one replaces
+  it, dragging inside it with a shape tool moves it (the hand always pans,
+  even over a whole-image selection), handles resize it or move polygon
+  corners, a click outside clears it. Esc abandons a shape mid-draw, then
+  clears; Cmd+A selects the whole image; Cmd+Shift+A or right-click →
+  Remove ROI clear. Selections stay put while scrubbing z/t or switching
+  channels, so one region can be followed through a timelapse, and they
+  are saved in sessions.
+- Cmd+M rasterizes the shape to a pixel mask exactly as drawn; a selection
+  dragged entirely off the image reports "Nothing to measure".
+
+### App
+- **Dock icon raises the control window**: clicking the app's dock icon
+  brings the control window above the stack and grid windows and focuses
+  it, un-minimizing it first if needed. Only real dock clicks do it —
+  cmd-tab or clicking a stack window leave the window order alone.
+- **LZW- and Deflate-compressed TIFFs open in the bundled app**: the
+  imagecodecs codec modules are now collected into the macOS and Windows
+  builds (they are imported dynamically, so PyInstaller missed them and
+  such files failed with "cannot import name 'lzw_decode'").
+- Regression suite: 44 checks.
+
 ## 1.4.0 — 2026-08-24
 
 ### Viewing

@@ -17,7 +17,7 @@ import pyqtgraph as pg
 from collections import OrderedDict
 
 from PySide6.QtCore import QEvent, QMimeData, QPoint, QRectF, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QCursor, QDrag, QImage, QKeySequence
+from PySide6.QtGui import QAction, QActionGroup, QCursor, QDrag, QImage, QKeySequence
 from PySide6.QtWidgets import QApplication, QMenu
 
 from . import settings as app_settings
@@ -104,6 +104,17 @@ class StackViewBox(pg.ViewBox):
         super().__init__(lockAspect=True, invertY=True)
         self._wheel_accum = 0
         self._wheel_letter = "z"
+        self.selection = None  # set by roi.Selection; draws with the shape tools
+
+    def mouseDragEvent(self, ev, axis=None):
+        if axis is None and self.selection is not None and self.selection.drag(ev):
+            return
+        super().mouseDragEvent(ev, axis)
+
+    def mouseClickEvent(self, ev):
+        if self.selection is not None and self.selection.click(ev):
+            return
+        super().mouseClickEvent(ev)
 
     def wheelEvent(self, ev, axis=None):
         mods = ev.modifiers()
@@ -367,6 +378,9 @@ class StackPane(QWidget):
         self.view.setFocusProxy(self)  # clicks on the image focus/activate the pane
         self.image_item = pg.ImageItem()
         self.viewbox.addItem(self.image_item)
+        from .roi import Selection
+
+        self.selection = Selection(self)
         self._middle.addWidget(self.view, 1)
         layout.addLayout(self._middle, 1)
 
@@ -629,6 +643,7 @@ class StackPane(QWidget):
 
     def unregister(self):
         global _active_pane
+        self.selection.detach()
         if self in _all_panes:
             _all_panes.remove(self)
         if _active_pane is self:
@@ -779,6 +794,8 @@ class StackPane(QWidget):
             return True
         if key == Qt.Key_F and not mods:
             self.toggle_flag()
+            return True
+        if key == Qt.Key_Escape and self.selection.handle_escape():
             return True
         # 1-9: in composite, flip that channel on/off; otherwise jump to it.
         if Qt.Key_1 <= key <= Qt.Key_9 and not mods:
@@ -998,6 +1015,9 @@ class StackPane(QWidget):
             self.probe_label.setText("")
             return
         pos = self.viewbox.mapSceneToView(scene_pos)
+        if self.selection.drawing():
+            self.selection.mouse_moved(pos)  # writes its own status line
+            return
         x, y = int(pos.x()), int(pos.y())
         h, w = self.stack.shape_yx
         if 0 <= x < w and 0 <= y < h:
@@ -1023,6 +1043,59 @@ class StackPane(QWidget):
             return float("-inf")
         data = self.stack.data
         return float(np.mean([np.mean(data[t, z, ci, ::8, ::8]) for ci in channels]))
+
+    # ---- measurements --------------------------------------------------
+
+    def measurement(self):
+        """Mean (MFI), min and max of the active channel inside the selection
+        (the whole image without one) at the current position — the projected
+        plane when the z projection is on, like the probe. None when this
+        stack has no image here (a shared-axes position past its range) or
+        the selection lies outside the image."""
+        from .measure import Measurement
+
+        if self._blank:
+            return None
+        t, z, c = self.position()
+        s = self.stack
+        if self._mip_on():
+            plane = stack_io.project_block(np.asarray(s.data[t, :, c]), self.proj_method)
+            z_label = self._proj_abbrev()
+        else:
+            plane = np.asarray(s.data[t, z, c])
+            z_label = str(z + 1)
+        region = self.selection.values(plane)
+        if region is None:
+            return None
+        values, area, where = region
+        return Measurement(
+            s.name,
+            c + 1,
+            z_label,
+            t + 1,
+            where,
+            area,
+            float(values.mean(dtype=np.float64)),
+            float(values.min()),
+            float(values.max()),
+            integer=bool(np.issubdtype(plane.dtype, np.integer)),
+        )
+
+    def measure(self):
+        """Cmd+M (Fiji's Analyze > Measure): add this position's measurement
+        to the Measurements table."""
+        from . import measure
+
+        m = self.measurement()
+        host = self.window()
+        if m is None:
+            if isinstance(host, QMainWindow):
+                why = "selection outside the image" if self.selection.roi else "no image at this position"
+                host.statusBar().showMessage(f"Nothing to measure: {why}", 4000)
+            return
+        measure.record(m)
+        if isinstance(host, QMainWindow):
+            host.statusBar().showMessage(f"Measured {m.stack} ({m.where()}): {m.summary()}", 5000)
 
     # ---- actions (invoked from menus of whichever window hosts us) -----
 
@@ -1606,6 +1679,51 @@ def build_menus(window: QMainWindow, active_pane: Callable[[], StackPane | None]
 
     _add(image_menu, "Export &Grid Montage...", "Ctrl+Shift+M", export_grid_montage)
 
+    analyze_menu = window.menuBar().addMenu("&Analyze")
+    _add(analyze_menu, "&Measure", "Ctrl+M", _with_pane(StackPane.measure))
+
+    def show_measurements():
+        from . import measure
+
+        measure.show_table()
+
+    def clear_measurements():
+        from . import measure
+
+        n = len(measure.measurements())
+        measure.clear()
+        _show_status(f"Cleared {n} measurement{'s' if n != 1 else ''}" if n else "No measurements")
+
+    _add(analyze_menu, "Measurements &Table", "", show_measurements)
+    _add(analyze_menu, "&Clear Measurements", "", clear_measurements)
+    analyze_menu.addSeparator()
+
+    from . import roi
+
+    tool_menu = analyze_menu.addMenu("Selection &Tool")
+    tool_group = QActionGroup(window)
+    tool_group.setExclusive(True)
+    for name in roi.TOOLS:
+        action = _add(
+            tool_menu,
+            f"{roi.TOOL_LABELS[name]} Tool",
+            roi.TOOL_KEYS[name],
+            lambda _checked=False, n=name: roi.set_tool(n),
+        )
+        action.setCheckable(True)
+        action.setChecked(name == roi.tool())
+        action.setData(name)
+        action.setStatusTip(roi.TOOL_HINTS[name])
+        tool_group.addAction(action)
+
+    def sync_tool_actions(name: str):
+        for action in tool_group.actions():
+            action.setChecked(action.data() == name)
+
+    roi.tool_changed().connect(sync_tool_actions)
+    _add(analyze_menu, "Select &All", QKeySequence.SelectAll, _with_pane(lambda p: p.selection.select_all()))
+    _add(analyze_menu, "Select &None", "Ctrl+Shift+A", _with_pane(lambda p: p.selection.clear()))
+
     view_menu = window.menuBar().addMenu("&View")
     _add(view_menu, "Zoom &In", QKeySequence.ZoomIn, _with_pane(lambda p: p.zoom(1 / 1.25)))
     _add(view_menu, "Zoom &Out", QKeySequence.ZoomOut, _with_pane(lambda p: p.zoom(1.25)))
@@ -1951,7 +2069,7 @@ _CHEATSHEET = """
 <tr><td><b>Alt + wheel/←→</b></td><td>scroll channel (also , .)</td>
     <td></td><td><b>Cmd+Shift+G</b></td><td>shared axes in grid</td></tr>
 <tr><td><b>1 … 9</b></td><td>channel on/off (jumps to it when not composite)</td>
-    <td></td><td></td><td></td></tr>
+    <td></td><td><b>Cmd+M</b></td><td>measure mean / min / max into the table</td></tr>
 <tr><td><b>pinch / Cmd+wheel</b></td><td>zoom at cursor</td>
     <td></td><td><b>Cmd+Shift+C</b></td><td>brightness / contrast</td></tr>
 <tr><td><b>Cmd+0 / Cmd+1</b></td><td>fit / actual size</td>
@@ -1968,7 +2086,15 @@ _CHEATSHEET = """
     <td></td><td><b>Cmd+Shift+M</b></td><td>export grid montage</td></tr>
 <tr><td><b>F</b></td><td>flag / unflag the active stack (★)</td>
     <td></td><td><b>Cmd+Alt+M</b></td><td>export stack montage (t×z)</td></tr>
+<tr><td><b>H / R / E / P / D</b></td><td>hand / rectangle / ellipse / polygon / freehand tool</td>
+    <td></td><td><b>Cmd+A / Cmd+Shift+A</b></td><td>select all / none</td></tr>
+<tr><td><b>Esc</b></td><td>abandon the shape being drawn, else clear the selection</td>
+    <td></td><td></td><td></td></tr>
 </table>
+<p>Selections: with a shape tool, drag on the image to draw (polygon: click
+the corners, double-click to close); drag inside a selection to move it,
+its handles resize it; a click outside clears it. <b>Cmd+M</b> measures
+inside the selection.</p>
 <p>Grid tiles: drag the <b>header strip</b> to rearrange (double-click it to
 solo) · the <b>★ only</b> box shows just the flagged tiles · <b>Sort</b>
 reorders tiles by name or brightness · <b>🔓</b> locks a tile out of shared

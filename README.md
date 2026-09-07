@@ -52,10 +52,10 @@ automatically** in Settings turns the daily look off. That check is the only
 network request the app ever makes.
 
 For the check to find a build, a release needs a downloadable asset whose name
-says which platform it is for — `TIFF-Visualizer-1.4.0-macos.dmg` (what
-`packaging/make_dmg.sh` writes) and `TIFF-Visualizer-1.4.0-windows.zip`. A
+says which platform it is for — `TIFF-Visualizer-1.5.0-macos.dmg` (what
+`packaging/make_dmg.sh` writes) and `TIFF-Visualizer-1.5.0-windows.zip`. A
 release with no matching asset still gets offered; the alert then just opens
-the release page. Tags must be plain `v1.4.0`-style versions: anything else is
+the release page. Tags must be plain `v1.5.0`-style versions: anything else is
 deliberately never offered (`tiff_visualizer/updater.py`).
 
 ## Setup
@@ -246,6 +246,39 @@ as one step, and a single undo reverts a whole Apply to all.
 Adjusted ranges are saved into the file's ImageJ display ranges, so Fiji shows
 the same contrast.
 
+## Measurements — Cmd+M
+
+Fiji's Analyze → Measure: **Cmd+M** measures the active stack's **current
+channel** at its current z/t position — the projected plane when the pane's
+z projection is on — inside its **selection**, or over the whole image when
+there is none, and appends **area, mean (MFI), min and max** as a row of the
+floating **Measurements** table (Analyze → Measurements Table). Works the
+same on a floating window and on the active tile of the grid, shared axes
+included. The table lists stack name, c/z/t and the ROI (shape plus bounding
+box, e.g. `rect 120,80 64×64`) alongside the numbers; **Copy** (or Cmd+C in
+the table) puts the selected rows — all rows when none are selected — on the
+clipboard tab-separated with a header line, ready for a spreadsheet, **Save
+As…** writes a CSV, **Delete** removes the selected rows and **Clear** (or
+Analyze → Clear Measurements) empties it. The table never steals focus, so
+measure, scrub, measure keeps flowing.
+
+### Selections — Fiji's rectangle, oval, polygon and freehand tools
+
+One app-wide **tool** — the row of buttons in the control window, Analyze →
+Selection Tool, or the keys **H / R / E / P / D** — decides what a left drag
+on an image does: the **Hand** pans, the shape tools draw. **Rectangle** and
+**Ellipse** drag out a box (whole pixels, clipped to the image), **Freehand**
+traces an outline, **Polygon** takes a click per corner and closes on a
+double-click or a click on the first corner. Each stack keeps one selection
+in Fiji yellow: drawing a new one replaces it, dragging inside it with a
+shape tool moves it (the hand always pans), its handles resize it (or move
+polygon corners), a click outside clears it, as do
+**Esc** (which first abandons a shape mid-draw), **Cmd+Shift+A** and
+right-click → Remove ROI; **Cmd+A** selects the whole image. Selections stay
+put while scrubbing z/t and switching channels, so Cmd+M can walk one region
+through a timelapse or across channels, and they are saved in sessions.
+Whole-image and selection rows sit side by side in the same table.
+
 ## Projections — Cmd+Shift+P
 
 Max / Min / Mean / Median / Sum over Z or T with a start/stop range. Results
@@ -264,7 +297,7 @@ Cmd+= / Cmd+- zoom, Cmd+1 actual size (1 image px = 1 screen px), Cmd+0 fit.
 ## Testing
 
 `QT_QPA_PLATFORM=offscreen .venv/bin/python -u tests/regression.py` runs the
-full regression suite (35 checks over the whole feature matrix, using
+full regression suite (44 checks over the whole feature matrix, using
 example_stacks/). Run it before releases and after risky changes.
 
 `example_stacks/` is 9 GB of local microscopy data and is not in the repo —
@@ -287,6 +320,12 @@ names.
 - `tiff_visualizer/control_panel.py` — the always-open control window.
 - `tiff_visualizer/bc_panel.py` — the floating, focus-following, pinnable
   Brightness & Contrast pane.
+- `tiff_visualizer/measure.py` — mean/min/max measurements (whole image or
+  inside the selection) and the floating Measurements table (copy as TSV,
+  save as CSV).
+- `tiff_visualizer/roi.py` — the selection tools (rectangle, ellipse,
+  polygon, freehand): the app-wide tool state, the pyqtgraph ROI items, the
+  drawing interaction on a pane's ViewBox, and the pixel masks Cmd+M measures.
 - `tiff_visualizer/updater.py` — the GitHub release check, its download, and
   the policy (version comparison, once-a-day, skipped versions) kept in pure
   functions the regression suite exercises without a network.

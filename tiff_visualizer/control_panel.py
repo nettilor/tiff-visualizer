@@ -12,6 +12,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QGridLayout,
     QHBoxLayout,
@@ -19,6 +20,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QStyle,
     QToolButton,
     QVBoxLayout,
@@ -237,10 +239,10 @@ class ControlWindow(FileDropMixin, QMainWindow):
         button("Open…", "Open TIFF stacks (Cmd+O)", self._open, 0, 0)
         button("Open folder…", "Open all TIFF stacks in a folder (Cmd+Shift+O)", self._open_folder, 0, 1)
         self.save_button = button(
-            "Save As…", "Save active stack in ImageJ format (Cmd+S)", self._save, 5, 0
+            "Save As…", "Save active stack in ImageJ format (Cmd+S)", self._save, 6, 0
         )
-        button("Shortcuts (?)", "Show the keyboard cheatsheet", self._cheatsheet, 5, 1)
-        button("Settings…", "App settings: RAM preloading budget (Cmd+,)", self._settings, 6, 0, colspan=2)
+        button("Shortcuts (?)", "Show the keyboard cheatsheet", self._cheatsheet, 6, 1)
+        button("Settings…", "App settings: RAM preloading budget (Cmd+,)", self._settings, 7, 0, colspan=2)
         self.bc_button = button(
             "B&&C", "Brightness/Contrast panel (Cmd+Shift+C)", self._bc, 1, 0
         )
@@ -255,9 +257,39 @@ class ControlWindow(FileDropMixin, QMainWindow):
             "Shared axes", "One set of c/z/t sliders drives all tiled stacks (Cmd+Shift+G)",
             self._toggle_shared, 3, 0, colspan=2, checkable=True,
         )
-        self.fit_button = button("Fit", "Fit image to window (Cmd+0)", self._fit, 4, 0)
+        # Selection tools (Fiji's toolbar): one app-wide tool, the menu's
+        # Analyze > Selection Tool actions and these buttons mirror each other.
+        from . import roi
+
+        tools = QHBoxLayout()
+        tools.setSpacing(4)
+        self.tool_group = QButtonGroup(self)
+        self.tool_group.setExclusive(True)
+        self.tool_buttons: dict[str, QToolButton] = {}
+        for name in roi.TOOLS:
+            b = QToolButton()
+            b.setText(roi.TOOL_LABELS[name])
+            b.setCheckable(True)
+            b.setChecked(name == roi.tool())
+            b.setFocusPolicy(Qt.NoFocus)
+            b.setToolTip(f"{roi.TOOL_LABELS[name]} tool ({roi.TOOL_KEYS[name]})\n{roi.TOOL_HINTS[name]}")
+            b.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            # Fusion draws a checked tool button barely darker; make the
+            # active tool unmistakable with the accent color.
+            b.setStyleSheet(
+                "QToolButton { padding: 3px 6px; border: 1px solid #3a3a3a; border-radius: 3px; }"
+                "QToolButton:checked { background: #2f6fd0; color: white; border-color: #2f6fd0; }"
+            )
+            b.clicked.connect(lambda _checked=False, n=name: roi.set_tool(n))
+            self.tool_group.addButton(b)
+            self.tool_buttons[name] = b
+            tools.addWidget(b)
+        grid.addLayout(tools, 4, 0, 1, 2)
+        roi.tool_changed().connect(self._on_tool_changed)
+
+        self.fit_button = button("Fit", "Fit image to window (Cmd+0)", self._fit, 5, 0)
         self.actual_button = button(
-            "100%", "Actual size, 1 image px = 1 screen px (Cmd+1)", self._actual, 4, 1
+            "100%", "Actual size, 1 image px = 1 screen px (Cmd+1)", self._actual, 5, 1
         )
 
         # Dropped-folder sections live between the buttons and the status line;
@@ -389,6 +421,9 @@ class ControlWindow(FileDropMixin, QMainWindow):
 
     def _on_focus_changed(self, *_):
         self.refresh_state()
+
+    def _on_tool_changed(self, name: str):
+        self.tool_buttons[name].setChecked(True)
 
     @contextmanager
     def bulk_update(self):

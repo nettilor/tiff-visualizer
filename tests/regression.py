@@ -15,8 +15,8 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from PySide6.QtCore import QEvent, QMimeData, QPoint, QSettings, Qt, QUrl
-from PySide6.QtGui import QKeyEvent
+from PySide6.QtCore import QEvent, QMimeData, QPoint, QPointF, QSettings, Qt, QUrl
+from PySide6.QtGui import QAction, QKeyEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
@@ -370,6 +370,166 @@ p1.close_bc_dock()
 assert p1.bc_dock is None
 ok("fused dock lifecycle")
 
+print("measurements")
+from tiff_visualizer import measure  # noqa: E402
+
+measure.clear()
+p1.set_channel(1)
+p1.bars["z"].set_value(3)
+p1.bars["t"].set_value(2)
+app.processEvents()
+plane = np.asarray(p1.stack.data[2, 3, 1])
+m = p1.measurement()
+assert (m.stack, m.c, m.z, m.t) == ("XY05.tif", 2, "4", 3)
+assert m.mean == float(plane.mean()) and m.min == float(plane.min()) and m.max == float(plane.max())
+assert m.roi == "whole image" and m.area == plane.size
+assert m.integer and m.cells()[6] == f"{plane.mean():.3f}" and m.cells()[8] == str(plane.max())
+p1.mip_box.setChecked(True)
+mp = p1.measurement()
+assert mp.z == "MIP" and mp.max >= m.max and mp.mean >= m.mean
+p1.set_proj_method("Mean")
+assert not p1.measurement().integer  # AVG projection is float
+p1.set_proj_method("Max", enable=False)
+p1.mip_box.setChecked(False)
+ok("measure: active channel at position, projected plane when MIP is on")
+# Cmd+M is the Analyze > Measure action of every window; it fills the table
+# without taking focus from the stack, and a blank tile measures nothing.
+measure_action = next(a for a in p1.window().findChildren(QAction) if a.text() == "&Measure")
+assert measure_action.shortcut().toString() == "Ctrl+M"
+p1.window().activateWindow()
+measure_action.trigger()
+measure_action.trigger()
+app.processEvents()
+table = measure._table
+assert table is not None and table.isVisible() and table.table.rowCount() == 2
+assert len(measure.measurements()) == 2 and table.testAttribute(Qt.WA_ShowWithoutActivating)
+assert table.table.item(1, 0).text() == "2" and table.table.item(1, 1).text() == "XY05.tif"
+p1._blank = True
+p1.measure()
+p1._blank = False
+assert len(measure.measurements()) == 2
+p2.measure()
+tsv = measure.to_tsv().splitlines()
+assert tsv[0].split("\t") == list(measure.COLUMNS) and len(tsv) == 4
+assert tsv[3].split("\t")[:2] == ["3", "XY06.tif"]
+assert measure.to_tsv([2]).splitlines()[1].startswith("3\tXY06.tif")
+csv_path = os.path.join(TMP, "m.csv")
+measure.save_csv(csv_path)
+assert open(csv_path).read().splitlines()[0] == ",".join(measure.COLUMNS)
+table.table.selectRow(0)
+table.delete_rows()
+assert [m.stack for m in measure.measurements()] == ["XY05.tif", "XY06.tif"]
+assert table.table.item(1, 0).text() == "2"  # renumbered
+measure.clear()
+assert table.table.rowCount() == 0 and not table.copy_button.isEnabled()
+table.close()
+ok("measurements table: Cmd+M appends, copy/CSV, delete rows, clear")
+
+print("selections")
+from tiff_visualizer import roi  # noqa: E402
+
+sel = p1.selection
+plane = np.asarray(p1.stack.data[2, 3, 1])
+sel.set_rect(10, 20, 64, 48)
+(ys, xs), mask = sel.mask()
+assert (ys, xs) == (slice(20, 68), slice(10, 74)) and mask.all()
+m = p1.measurement()
+sub = plane[20:68, 10:74]
+assert m.roi == "rect 10,20 64×48" and m.area == 64 * 48
+assert m.mean == float(sub.mean()) and m.min == sub.min() and m.max == sub.max()
+sel.set_rect(-30, -30, 50, 50)  # clipped to the image
+assert sel.describe() == "rect 0,0 20×20"
+sel.set_rect(900, 700, 200, 200, ellipse=True)
+assert sel.kind == "ellipse" and sel.describe() == "ellipse 900,700 60×20"
+sel.set_rect(100, 100, 100, 60, ellipse=True)
+area = p1.measurement().area
+assert abs(area - np.pi * 50 * 30) / (np.pi * 50 * 30) < 0.02  # rasterized ellipse
+sel.set_polygon([(0, 0), (100, 0), (0, 100), (0, 0)])  # right triangle, closing repeat dropped
+assert sel.kind == "polygon" and len(sel.roi.points()) == 3
+assert abs(p1.measurement().area - 5000) < 100
+sel.set_freehand([(50, 50), (150, 50), (150, 150), (50, 150)])
+assert sel.kind == "freehand" and p1.measurement().area == 100 * 100
+sel.set_polygon([(0, 0), (1, 1)])  # too few corners: nothing
+assert sel.kind == "freehand"
+sel.set_polygon([(2000, 2000), (2100, 2000), (2000, 2100)])  # entirely outside the image
+assert p1.measurement() is None
+sel.select_all()
+assert sel.describe() == "rect 0,0 960×720" and p1.measurement().area == plane.size
+ok("selection masks: rect, ellipse, polygon, freehand, clipping, select all")
+
+# Drawing through the ViewBox: a rectangle by drag, a polygon by clicks.
+class FakeMouse:
+    def __init__(self, vb, x, y, start=False, finish=False, double=False, x0=None, y0=None):
+        self._vb, self._start, self._finish, self._double = vb, start, finish, double
+        self._pos = vb.mapFromView(QPointF(x, y))
+        self._down = vb.mapFromView(QPointF(x if x0 is None else x0, y if y0 is None else y0))
+        self.accepted = False
+
+    def button(self):
+        return Qt.LeftButton
+
+    def pos(self):
+        return self._pos
+
+    def buttonDownPos(self, *_):
+        return self._down
+
+    def isStart(self):
+        return self._start
+
+    def isFinish(self):
+        return self._finish
+
+    def double(self):
+        return self._double
+
+    def accept(self):
+        self.accepted = True
+
+
+vb = p1.viewbox
+assert not sel.drag(FakeMouse(vb, 5, 5, start=True))  # hand tool: the ViewBox pans
+rect_action = next(a for a in p1.window().findChildren(QAction) if a.text() == "Rectangle Tool")
+assert rect_action.shortcut().toString() == "R"
+rect_action.trigger()
+assert roi.tool() == "rect"
+ctrl = control_panel.get_control_window()
+assert ctrl.tool_buttons["rect"].isChecked()
+sel.drag(FakeMouse(vb, 30.4, 40.6, start=True))
+sel.drag(FakeMouse(vb, 90.2, 70.1, x0=30.4, y0=40.6))
+assert sel.drawing() and sel._preview.isVisible() and p1.probe_label.text() == "rect 30,41 60×29"
+sel.drag(FakeMouse(vb, 94.4, 100.6, finish=True, x0=30.4, y0=40.6))
+assert not sel.drawing() and sel.describe() == "rect 30,41 64×60"
+assert sel.click(FakeMouse(vb, 50, 50)) and sel.roi is not None  # inside: kept
+assert sel.click(FakeMouse(vb, 500, 500)) and sel.roi is None  # outside: cleared
+roi.set_tool("polygon")
+for x, y in ((10, 10), (110, 10), (110, 110)):
+    sel.click(FakeMouse(vb, x, y))
+assert sel.drawing() and "3 corners" in p1.probe_label.text()
+sel.click(FakeMouse(vb, 10, 110))
+sel.click(FakeMouse(vb, 10, 110, double=True))
+assert not sel.drawing() and sel.kind == "polygon" and p1.measurement().area == 100 * 100
+roi.set_tool("freehand")
+sel.drag(FakeMouse(vb, 0, 0, start=True))
+sel.drag(FakeMouse(vb, 200, 0, x0=0, y0=0))
+sel.drag(FakeMouse(vb, 200, 100, x0=0, y0=0))
+sel.drag(FakeMouse(vb, 0, 100, finish=True, x0=0, y0=0))
+assert sel.kind == "freehand" and p1.measurement().area == 200 * 100
+roi.set_tool("polygon")
+sel.click(FakeMouse(vb, 10, 10))
+assert sel.drawing() and p1.handle_key(key(Qt.Key_Escape)) and not sel.drawing()
+assert sel.roi is None  # starting a new shape dropped the freehand one
+sel.select_all()
+assert p1.handle_key(key(Qt.Key_Escape)) and sel.roi is None
+assert not p1.handle_key(key(Qt.Key_Escape))  # nothing to clear: not handled
+sel.select_all()
+assert sel.roi.translatable  # polygon tool still active: drag inside moves it
+roi.set_tool("hand")
+assert p1.view.viewport().cursor().shape() == Qt.ArrowCursor
+assert not sel.roi.translatable  # the hand pans even over a whole-image selection
+sel.clear()
+ok("drawing tools: drag rect, click polygon, trace freehand, click outside, Esc")
+
 print("sessions")
 workspace.combine_all()
 app.processEvents()
@@ -378,7 +538,10 @@ app.processEvents()
 p1.bars["t"].set_value(3)
 p1.set_flagged(True)
 p1.set_proj_method("Median")
+p1.selection.set_polygon([(5, 5), (60, 5), (30, 50)])
+p2.selection.set_rect(10, 20, 30, 40, ellipse=True)
 data = session.capture()
+assert next(e for e in data["stacks"] if e["path"].endswith("XY05.tif"))["roi"]["kind"] == "polygon"
 assert next(e for e in data["stacks"] if e["path"].endswith("XY05.tif"))["proj"] == "Median"
 assert data["workspace"]["minimalist"] is True
 grid_order = [q.stack.name for q in workspace.get_workspace().panes]
@@ -398,10 +561,14 @@ assert [q.stack.name for q in ws.panes] == grid_order
 assert restored.flagged and ws.flag_checkbox.isVisibleTo(ws)
 assert restored.proj_method == "Median" and restored.mip_box.isChecked()
 assert "MED" in restored.mip_box.text() and "z MED" in restored.header_label.text()
+assert restored.selection.describe() == "polygon 5,5 55×45"
+restored2 = next(p for p in viewer._all_panes if p.stack.name == "XY06.tif")
+assert restored2.selection.describe() == "ellipse 10,20 30×40"
+assert next(p for p in viewer._all_panes if p.stack.name == "XY07.tif").selection.roi is None
 restored.mip_box.setChecked(False)
 restored.set_proj_method("Max", False)
 ws.minimal_checkbox.setChecked(False)
-ok("session round-trip incl. minimalist, grid order and flags")
+ok("session round-trip incl. minimalist, grid order, flags and selections")
 session.close_all()
 app.processEvents()
 

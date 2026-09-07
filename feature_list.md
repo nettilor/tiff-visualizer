@@ -2,8 +2,8 @@
 For all features ask the user before implementing if they will not be practical!
 At each version bump, completed items are rolled up into CHANGELOG.md (grouped by area, per release); this file stays the working tracker.
 
-Current released version: **1.4.0** (see CHANGELOG.md); completed items not yet in
-the changelog are queued for **1.5.0**.
+Current released version: **1.5.0** (see CHANGELOG.md); completed items not yet in
+the changelog are queued for **1.6.0**.
 
 ### To implement
 
@@ -17,12 +17,16 @@ the changelog are queued for **1.5.0**.
 - [ ] Split channels into tiles: explode the active stack into one tile per channel (same underlying data, z/t stay synced) for side-by-side channel comparison; one click merges it back.
 - [ ] Condition tags: give each tile a short colored label (control / treated / …) shown in its header; sort or filter the grid by tag; optionally import a position→condition mapping from a simple CSV/text file.
 - [ ] Spatial calibration: read pixel size from ImageJ metadata, µm scale bar, cursor position in µm
-- [ ] ROI + stats: rectangle ROI with per-channel mean/min/max/std updating while scrubbing; line-profile plots
+- [ ] Live ROI stats: the selection's per-channel mean/min/max/std shown in the pane and updating while scrubbing, without a Cmd+M per position
+- [ ] Line profiles: a line tool with an intensity-profile plot along it
+- [ ] Grid selections: mirror one selection onto every tile (with Shared view) and a Measure All that appends one row per tile
 - [ ] Recent files menu
 
 ### To fix
 
 ### Completed
+- [x] Selection tools + measure inside them (Fiji's rectangle, oval, polygon and freehand selections: one app-wide tool picked from the control window's tool row, Analyze → Selection Tool or the keys H/R/E/P/D — the Hand pans, the shape tools draw on a left drag; rectangle/ellipse drag out a whole-pixel box clipped to the image, freehand traces an outline, polygon takes a click per corner and closes on double-click or a click on the first corner. One selection per stack in Fiji yellow (pyqtgraph ROI items): drawing a new one replaces it, drag inside with a shape tool moves it (the hand always pans, even over a whole-image selection), handles resize it / move corners, click outside clears it, Esc abandons a shape mid-draw then clears, Cmd+A selects all, Cmd+Shift+A / right-click Remove ROI clear; the ViewBox routes left drags/clicks through roi.Selection first so the hand tool's pan/zoom is untouched. Cmd+M measures inside the selection — the shape is rasterized to a pixel mask exactly as drawn — with new ROI (shape + bounding box) and Area columns in the table and "whole image" rows when there is none; selections persist across z/t/channel changes and are saved in sessions)
+- [x] Measure MFI with Cmd+M (Analyze → Measure, like Fiji: mean/min/max of the active stack's current channel over the whole image at the current z/t — the projected plane when the z projection is on — for floating windows and the active grid tile alike, shared axes included; each measurement appends a row (#, stack, c, z, t, mean, min, max) to a floating Measurements table (Analyze → Measurements Table) that pops up without stealing focus; Copy / Cmd+C copies the selected or all rows tab-separated with a header for spreadsheets, Save As… writes CSV, Delete drops selected rows, Clear / Analyze → Clear Measurements empties it; whole-image only for now, ROIs later)
 - [x] Dock icon brings the main window to the front (clicking the app's dock icon raises the control window above the stack and grid windows and gives it focus, un-minimizing it first if needed — macOS only guarantees the *app* comes forward, so the control window used to stay buried under the stacks. Only real dock clicks do it: macOS answers one with a reopen that Qt reports as a second "app active" with no deactivation in between, so cmd-tab or clicking a stack window still leaves the window order alone)
 - [x] Open all / Close all in dropped-folder lists (two buttons under each folder section's file list: Open all opens every stack in the folder that isn't open yet, Close all closes every pane showing one of them — including tiles inside the grid; each button greys out when it has nothing to do and the status bar reports "Opened/Closed n stacks". Both run as one batch: viewer.open_paths() loads the memory-mappable stacks and hands them to the grid in a single add_panes(), WorkspaceWindow.close_panes() detaches many tiles with one relayout, and the control window suspends its own refreshes for the duration — ~7x faster at 11 stacks and more beyond, since a per-stack relayout is O(n²). Open folder…, multi-file Open… and file drops go through the same batched path)
 - [x] Z-projection type on the fly (the pane's projection checkbox is labeled with the live method — MIP / MIN / AVG / MED / SUM plus a ▾ caret — and right-clicking it offers Fiji's five methods (Max intensity, Min intensity, Average, Median, Sum slices); picking one also switches the projection on. The header reads "z AVG", PNG/GIF exports are named _AVG/_MED/…, the stack montage's collapse option follows the pane's method, and the workspace's "MIP all" gained the same right-click menu, applying the chosen method to every tile. Sum scales its display window by the slice count so it reads like the mean on screen while the pixel probe reports the true sums; the method is saved in sessions)
