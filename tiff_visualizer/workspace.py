@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QSizePolicy,
     QMessageBox,
     QProgressDialog,
     QPushButton,
@@ -293,6 +294,7 @@ class WorkspaceWindow(FileDropMixin, QMainWindow):
         self.panes: list[StackPane] = []
         self.active_pane: StackPane | None = None
         self.solo_pane: StackPane | None = None
+        self._probed_pane: StackPane | None = None  # tile named in probe_label
         self._init_file_drops()
 
         central = QWidget()
@@ -359,7 +361,15 @@ class WorkspaceWindow(FileDropMixin, QMainWindow):
         self.flag_checkbox.toggled.connect(self._on_flag_filter)
         self.flag_checkbox.hide()
         controls.addWidget(self.flag_checkbox)
-        controls.addStretch(1)
+        # Live pixel readout for the tile under the cursor (the grid's
+        # counterpart of a stack window's probe row; the only one in
+        # Minimalist mode). Takes the slack between the mode boxes and the
+        # combos so it costs no space; long values clip rather than widen
+        # the window.
+        self.probe_label = QLabel()
+        self.probe_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.probe_label.setContentsMargins(12, 0, 8, 0)
+        controls.addWidget(self.probe_label, 1)
         controls.addWidget(QLabel("Sort:"))
         self.sort_combo = QComboBox()
         self.sort_combo.setFocusPolicy(Qt.NoFocus)
@@ -440,6 +450,7 @@ class WorkspaceWindow(FileDropMixin, QMainWindow):
             pane.channels_changed.connect(self._on_pane_channels_changed)
             pane.flag_toggled.connect(self._on_flag_toggled)
             pane.solo_requested.connect(self.toggle_solo)
+            pane.probed.connect(self._on_pane_probed)
         self.solo_pane = None  # a joining pane always becomes visible
         if self.sort_combo.currentData() == "name":
             self.panes.sort(key=lambda p: _natural_key(p.stack.name))
@@ -476,11 +487,15 @@ class WorkspaceWindow(FileDropMixin, QMainWindow):
             (pane.channels_changed, self._on_pane_channels_changed),
             (pane.flag_toggled, self._on_flag_toggled),
             (pane.solo_requested, self.toggle_solo),
+            (pane.probed, self._on_pane_probed),
         ):
             try:
                 signal.disconnect(slot)
             except RuntimeError:
                 pass
+        if self._probed_pane is pane:
+            self._probed_pane = None
+            self.probe_label.setText("")
         pane.setParent(None)
         pane.set_tiled(False)
         pane.clear_shared()
@@ -767,6 +782,14 @@ class WorkspaceWindow(FileDropMixin, QMainWindow):
                 pane.set_proj_method(self.proj_method)
             else:
                 pane.mip_box.setChecked(False)
+
+    # ---- pixel probe ---------------------------------------------------
+
+    def _on_pane_probed(self, pane: StackPane, text: str):
+        """Mirror a tile's probe row in the bottom bar, prefixed with the
+        stack's name since any tile may be the one under the cursor."""
+        self._probed_pane = pane if text else None
+        self.probe_label.setText(f"{pane.stack.name}:  {text}" if text else "")
 
     # ---- minimalist mode -----------------------------------------------
 

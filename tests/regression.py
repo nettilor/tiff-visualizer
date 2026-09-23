@@ -249,10 +249,18 @@ app.processEvents()
 assert ws.shared_checkbox.isChecked()
 assert not p1.close_button.isVisibleTo(p1) and p1.title_label.isVisibleTo(p1)
 assert not p1.composite_box.isVisibleTo(p1)
+assert not p1.probe_label.isVisibleTo(p1) and ws.probe_label.isVisibleTo(ws)
+# The grid's bottom bar mirrors the hovered tile's pixel readout (the only
+# readout in minimalist mode), named after the stack.
+p1._on_mouse_moved(p1.viewbox.mapViewToScene(QPointF(10.5, 20.5)))
+assert p1.probe_label.text().startswith("x=10 y=20  value: ")
+assert ws.probe_label.text() == f"{p1.stack.name}:  {p1.probe_label.text()}"
+p2._on_mouse_moved(p2.viewbox.mapViewToScene(QPointF(-5, -5)))  # off the image
+assert ws.probe_label.text() == ""
 ws.minimal_checkbox.setChecked(False)
 app.processEvents()
 assert p1.close_button.isVisibleTo(p1)
-ok("minimalist mode on/off")
+ok("minimalist mode on/off + bottom-bar pixel probe")
 ws._set_active(p1)
 QTest.keyClick(ws, Qt.Key_Return)
 app.processEvents()

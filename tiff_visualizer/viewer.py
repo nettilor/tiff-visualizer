@@ -278,6 +278,7 @@ class StackPane(QWidget):
     close_requested = Signal(object)
     flag_toggled = Signal(object)  # self, on flag/unflag (F)
     solo_requested = Signal(object)  # self, on header double-click in the grid
+    probed = Signal(object, str)  # self, probe-row text (pixel value / selection)
 
     def __init__(self, stack: TiffStack):
         super().__init__()
@@ -1010,9 +1011,17 @@ class StackPane(QWidget):
         parts.append(f"{w}×{h} · {depth}")
         self.header_label.setText("  ·  ".join(parts))
 
+    def set_probe(self, text: str):
+        """Write the probe row (pixel readout, or the selection while it is
+        drawn) and tell the workspace, whose bottom bar mirrors it for
+        whichever tile the cursor is over — the only readout in Minimalist
+        mode, where the per-tile row is hidden."""
+        self.probe_label.setText(text)
+        self.probed.emit(self, text)
+
     def _on_mouse_moved(self, scene_pos):
         if self._blank:
-            self.probe_label.setText("")
+            self.set_probe("")
             return
         pos = self.viewbox.mapSceneToView(scene_pos)
         if self.selection.drawing():
@@ -1028,9 +1037,9 @@ class StackPane(QWidget):
                 val = " ".join(fmt(v) for v in values)
             else:
                 val = fmt(values[c])
-            self.probe_label.setText(f"x={x} y={y}  value: {val}")
+            self.set_probe(f"x={x} y={y}  value: {val}")
         else:
-            self.probe_label.setText("")
+            self.set_probe("")
 
     def mean_intensity(self) -> float:
         """Mean of the visible channels at the current position (subsampled);

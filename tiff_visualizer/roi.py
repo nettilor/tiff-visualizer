@@ -369,7 +369,7 @@ class Selection:
             if ev.isFinish():
                 self.cancel()
                 self.set_rect(rect.x(), rect.y(), rect.width(), rect.height(), ellipse=t == "ellipse")
-        self.pane.probe_label.setText(status)
+        self.pane.set_probe(status)
         return True
 
     def _drag_rect(self, pos: QPointF) -> QRectF:
@@ -420,7 +420,7 @@ class Selection:
             return
         self._show_preview(_polyline_path(self._points + [(pos.x(), pos.y())], close=len(self._points) > 1))
         n = len(self._points)
-        self.pane.probe_label.setText(
+        self.pane.set_probe(
             f"polygon: {n} corner{'s' if n != 1 else ''}"
             + (" — double-click or click the first corner to close" if n >= 3 else "")
         )
