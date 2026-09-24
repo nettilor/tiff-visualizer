@@ -1,5 +1,113 @@
 # Changelog
 
+## 1.6.0 — 2026-09-24
+
+### Exports
+- **Montage labels say where every tile came from**: Export Grid Montage
+  labels each tile `XY05.tif  ·  c 1+2  z 5  t 12` — the displayed
+  channels, z slice and t frame, with the projection (`z MIP`, `z AVG`, …)
+  in place of the slice when it is on. GIF frames follow the movie's
+  position, and frames past a stack's end read "no image". When a cell is
+  too narrow for one line, every tile switches to name over position, so
+  the sheet and every GIF frame keep one size; labels are clipped to their
+  cell instead of running into the neighbor's. Export Stack Montage gets a
+  title line with the stack name, channels and projection. Both are on by
+  default, each with a checkbox to turn it off.
+- **t and z export ranges**: Export Stack Montage has t and z ranges next
+  to the every-nth steps (the z range is greyed out while z collapses to a
+  projection, which covers every slice as on screen); Export Movie and grid
+  montage GIFs get a range for the animated axis. Ranges are remembered only
+  while narrowed, so a full range stays full on a longer stack.
+- Default file names say what is inside: `XY05_t3_z2-6.gif` (instead of
+  naming only the current frame), `XY05_montage_t2-4.png` / `…_MIP.png`,
+  `montage_t4-8.gif`.
+- Export Movie shows a cancelable progress bar and no longer holds every
+  frame in RAM; with nothing to animate it says so instead of writing a
+  one-frame GIF.
+- Copy and Export PNG refuse a grid tile that is black on screen (shared
+  position past its end), and movies and grid GIFs take the displayed
+  position instead of exporting a stale frame.
+- Every export reports success in the window you are working in, and a
+  failed write (read-only folder, full disk) in a dialog.
+- Export Stack Montage remembers "collapse z" whatever the projection
+  method, and no longer offers a collapse that would leave a single tile.
+
+### Files
+- **Save As could destroy the original file**: saving over a file that was
+  still memory-mapped — after an earlier Save As, from a relative path, or
+  with the same file open twice — truncated it. Every open copy of the
+  target now moves into RAM first, and Save As waits for background
+  preloads and renders still reading it.
+- Read-only TIFFs open.
+- A NaN pixel no longer turns a float image black: NaN renders black and is
+  left out of display ranges and measurements, like Fiji.
+- RGB TIFFs open composite in red, green and blue.
+- Fiji's single-channel display range (min/max) is read and written back;
+  8- and 16-bit palette LUTs are used; ImageJ "color" mode survives a save,
+  and a multi-channel stack saved with Composite unchecked is written in
+  "color" mode — one channel at a time in its LUT color, as shown.
+- Single-channel stacks saved by the app reopen.
+- Symlinked positions keep their own names in headers, montage labels and
+  export names.
+- Float images: Reset spans the data, and a flat plane gets a range scaled
+  to its values instead of +1.
+
+### Grid
+- Locked tiles keep their own sliders when tiles join or leave, float
+  without jumping to the shared position, and locks clear (without moving
+  anything) when shared axes turn off.
+- A tile with its projection on stays drawn when the shared z is past its
+  slice count, and its arrow keys still step the shared z.
+- **Playback renders off the UI thread**: shared playback prefetches through
+  the render pool (11 stacks: ~144 ms → ~1 ms of UI time per tick, no
+  dropped ticks) and keeps playing at its speed when tiles join or leave.
+- The grid keeps the live pixel value: the bottom controls row mirrors the
+  probe of whichever tile the cursor is over, so Minimalist mode still
+  shows it.
+- "★ only" clears when the last flagged tile closes or floats.
+- Stacks combined into an empty grid sync under Shared channels.
+- Turning Shared axes off leaves Minimalist; any drag returns the sort to
+  Manual; Brightness sort ranks what each tile displays, projections
+  included.
+
+### Viewer
+- The pixel readout updates when the plane changes under a still cursor.
+- With z collapsed to a projection, arrows, wheel and Space no longer move
+  the hidden slice, and the header drops its slice label.
+- Save As and Projection keep the pane's Composite state; a projection
+  opens with the source's visible channels.
+- Closing a floating window frees its stack (it stayed in RAM and dropped
+  out of the preload budget's count).
+
+### Sessions & selections
+- Restored contrast shows immediately instead of the load-time one until
+  you scrub.
+- Per-tile projection settings survive a restore under MIP all.
+- Sessions store absolute paths and still open older relative ones.
+- Ellipses are measured and saved as the true ellipse (they were a
+  24-sided polygon: ~1.2% of the area off, shrinking ~2 px per save and
+  restore).
+- Replacing, removing or clearing a selection mid-drag can no longer crash
+  the app.
+
+### Brightness & Contrast
+- Histogram, Auto and Reset use the displayed plane — the projection when
+  it is on.
+- Float images show enough decimals, and nudges step by an amount scaled
+  to the data.
+- The panel retargets when its stack closes, Apply to all never pushes a
+  closed stack's range, and undo history no longer keeps closed stacks in
+  RAM.
+
+### App
+- Files opened together from Finder or the Dock open as one batch.
+- Folder lists, Open Folder… and dropped folders sort naturally (XY2 before
+  XY10) and skip macOS `._` files; their checkboxes match stacks opened
+  through relative or symlinked paths.
+- A manual Check for Updates during the launch check still answers;
+  `darwin`-named release assets count as macOS.
+- Regression suite: 89 checks.
+
 ## 1.5.0 — 2026-09-06
 
 ### Measurements

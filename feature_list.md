@@ -2,8 +2,8 @@
 For all features ask the user before implementing if they will not be practical!
 At each version bump, completed items are rolled up into CHANGELOG.md (grouped by area, per release); this file stays the working tracker.
 
-Current released version: **1.5.0** (see CHANGELOG.md); completed items not yet in
-the changelog are queued for **1.6.0**.
+Current released version: **1.6.0** (see CHANGELOG.md); completed items not yet in
+the changelog are queued for **1.7.0**.
 
 ### To implement
 

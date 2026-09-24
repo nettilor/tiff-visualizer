@@ -52,10 +52,10 @@ automatically** in Settings turns the daily look off. That check is the only
 network request the app ever makes.
 
 For the check to find a build, a release needs a downloadable asset whose name
-says which platform it is for — `TIFF-Visualizer-1.5.0-macos.dmg` (what
-`packaging/make_dmg.sh` writes) and `TIFF-Visualizer-1.5.0-windows.zip`. A
+says which platform it is for — `TIFF-Visualizer-1.6.0-macos.dmg` (what
+`packaging/make_dmg.sh` writes) and `TIFF-Visualizer-1.6.0-windows.zip`. A
 release with no matching asset still gets offered; the alert then just opens
-the release page. Tags must be plain `v1.5.0`-style versions: anything else is
+the release page. Tags must be plain `v1.6.0`-style versions: anything else is
 deliberately never offered (`tiff_visualizer/updater.py`).
 
 ## Setup
@@ -116,14 +116,19 @@ shown at the bottom. Closing the control window quits the app.
   intensity, Average, Median and Sum slices on the fly.
 - **Cmd+O** opens more stacks; **Cmd+Shift+O** opens a whole folder of TIFFs.
 - **Cmd+C / Cmd+E / Cmd+Shift+E**: copy view to clipboard / export PNG /
-  export a t- or z-series as a GIF movie — full resolution, current contrast.
+  export a t- or z-series as a GIF movie — full resolution, current contrast,
+  over the whole axis or a **from–to range**. Default names say what is
+  inside (`XY05_t3_z2-6.gif`); a grid tile that shows no image at the shared
+  position is refused rather than exported as a stale frame.
 - **Cmd+Alt+M** (Image → Export Stack Montage…): the stack as one contact
   sheet — **t across columns, z down rows** with position labels framing the
   sheet (a single varying axis wraps into a near-square grid instead). Options:
-  every-nth t/z, z as rows **or as a max projection**, full/half/quarter
-  resolution (with a live output-size estimate), and channels **as displayed**
-  (the visible channels, like the view) or **one file per channel**
-  (`…_C1.png`, `…_C2.png`, …).
+  **t and z ranges** plus every-nth t/z, z as rows **or as a projection**,
+  full/half/quarter resolution (with a live output-size estimate), and
+  channels **as displayed** (the visible channels, like the view) or **one
+  file per channel** (`…_C1.png`, `…_C2.png`, …). A title line above the
+  sheet names the stack, channels and projection (`XY05.tif  ·  c 1+2  z MIP`)
+  so a sheet always says where it came from; a checkbox turns it off.
 - **Cmd+Alt+S / Cmd+Alt+O / Cmd+Alt+R**: save / open / restore-last session
   (open stacks, positions, contrast, layout — auto-saved on quit).
 - **?** shows the keyboard cheatsheet. Adjacent planes are pre-rendered and
@@ -171,9 +176,14 @@ sessions, and View → Copy Flagged Names puts the flagged stack names on the
 clipboard for lab notes.
 
 **Export Grid Montage** (Image menu, Cmd+Shift+M): the grid as one labeled,
-figure-ready image — a PNG at the current position, or a GIF over t or z —
-at full/half/quarter resolution, honoring each tile's contrast, channels and
-MIP state. With ★ only or solo active, the montage exports what you see.
+figure-ready image — a PNG at the current position, or a GIF over t or z
+(the whole axis or a from–to range) — at full/half/quarter resolution,
+honoring each tile's contrast, channels and MIP state. Each tile is labeled
+with its name **and where it came from** — `XY05.tif  ·  c 1+2  z 5  t 12`,
+with the projection (`z MIP`, `z AVG`, …) in place of the slice when it is on
+and GIF frames following the movie — on two lines when a cell is too narrow
+for one; checkboxes turn names and positions off. With ★ only or solo
+active, the montage exports what you see.
 
 Panes are moved, never rebuilt: position, zoom and contrast survive every
 combine/split, and each floating window's position and size are remembered,
@@ -205,7 +215,8 @@ region on one stack and every tile shows the same region.
 
 The **🔓** button on a tile locks it out of shared axes: it keeps its position
 (and gets its own bars back) while the others scrub — pin a reference
-timepoint and compare. Unlocking re-adopts the shared position.
+timepoint and compare. Unlocking re-adopts the shared position; turning
+shared axes off clears every lock, leaving each tile where it is.
 
 ### Shared channels
 
@@ -288,7 +299,10 @@ convention). Mean and Sum promote to 32-bit float, like Fiji.
 ## Saving — Cmd+S
 
 Save As writes an ImageJ-format hyperstack TIFF (axes TZCYX, LUTs, display
-ranges, composite mode, slice labels) that Fiji opens identically.
+ranges, composite mode, slice labels) that Fiji opens identically — with
+Composite unchecked, in Fiji's "color" mode (one channel at a time in its LUT
+color, as shown). Saving over a file that is open, even in another window,
+is safe: the open copies move into RAM first.
 
 ## Zoom (View menu)
 
@@ -297,7 +311,7 @@ Cmd+= / Cmd+- zoom, Cmd+1 actual size (1 image px = 1 screen px), Cmd+0 fit.
 ## Testing
 
 `QT_QPA_PLATFORM=offscreen .venv/bin/python -u tests/regression.py` runs the
-full regression suite (44 checks over the whole feature matrix, using
+full regression suite (89 checks over the whole feature matrix, using
 example_stacks/). Run it before releases and after risky changes.
 
 `example_stacks/` is 9 GB of local microscopy data and is not in the repo —
