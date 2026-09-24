@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -36,7 +37,7 @@ def capture() -> dict:
             continue  # unsaved derived stacks (projections) can't be reopened
         t, z, c = pane.position()
         entry = {
-            "path": str(pane.stack.path),
+            "path": os.path.abspath(pane.stack.path),
             "position": [t, z, c],
             "ranges": [list(map(float, r)) for r in pane.stack.ranges],
             "visible_channels": list(pane.visible_channels),
@@ -85,7 +86,9 @@ def restore(data: dict, parent=None):
     missing = []
     grid_panes = []
     for entry in data.get("stacks", []):
-        path = Path(entry["path"])
+        # Absolute (a symlink keeps its name); sessions saved before paths
+        # were made absolute may hold one relative to the working directory.
+        path = Path(os.path.abspath(entry["path"]))
         if not path.exists():
             missing.append(path.name)
             continue
@@ -98,6 +101,9 @@ def restore(data: dict, parent=None):
         saved_ranges = entry.get("ranges", [])
         for c in range(min(len(saved_ranges), stack.n_channels)):
             stack.ranges[c] = saved_ranges[c]
+        # The pane already rendered (and cached) a plane with the load-time
+        # ranges; a new version keys every cached plane as stale.
+        stack.version += 1
         visible = entry.get("visible_channels", [])
         for c in range(min(len(visible), stack.n_channels)):
             pane.visible_channels[c] = bool(visible[c])
@@ -120,7 +126,7 @@ def restore(data: dict, parent=None):
         if "geometry" in entry:
             pane.saved_window_geometry = _geometry_from_str(entry["geometry"])
         if entry.get("in_grid"):
-            grid_panes.append((pane, entry.get("locked", False)))
+            grid_panes.append((pane, entry))
         else:
             window = StackWindow(pane)
             window.show()
@@ -135,9 +141,14 @@ def restore(data: dict, parent=None):
         ws.set_proj_method(ws_info.get("proj_all", "Max"), enable=False)
         ws.mip_checkbox.setChecked(ws_info.get("mip_all", False))
         ws.grid_combo.setCurrentIndex(ws_info.get("grid", 0))
-        ws.add_panes([p for p, _locked in grid_panes])
-        for pane, locked in grid_panes:
-            if locked:
+        ws.add_panes([p for p, _entry in grid_panes])
+        for pane, entry in grid_panes:
+            # Joining a grid with MIP all on forces the workspace's method on
+            # every tile; put back what each tile had when it was saved.
+            if pane.mip_box is not None:
+                pane.set_proj_method(entry.get("proj", "Max"), enable=False)
+                pane.mip_box.setChecked(bool(entry.get("mip")))
+            if entry.get("locked", False):
                 pane.lock_button.setChecked(True)
         ws.flag_checkbox.setChecked(ws_info.get("flag_filter", False))
         if "geometry" in ws_info:

@@ -7,6 +7,8 @@ intact, and anything we write back stays readable by Fiji.
 
 from __future__ import annotations
 
+import os
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -15,6 +17,10 @@ import numpy as np
 import tifffile
 
 AXES_ORDER = "TZCYX"
+
+# Every live stack, so a save can move all memory maps of the file it is
+# about to overwrite into RAM first (see _detach_from).
+_open_stacks: "weakref.WeakValueDictionary[int, TiffStack]" = weakref.WeakValueDictionary()
 
 # Fiji's default channel colors for composites without embedded LUTs.
 _DEFAULT_COLORS = [
@@ -33,12 +39,33 @@ def _ramp_lut(color: tuple[float, float, float]) -> np.ndarray:
     return (np.outer(ramp, color)).astype(np.uint8)  # (256, 3)
 
 
+def _finite(plane: np.ndarray) -> np.ndarray:
+    """The plane's values without NaN/inf, which Fiji leaves out of its
+    statistics (a single NaN would otherwise make every range NaN)."""
+    plane = np.asarray(plane)
+    if np.issubdtype(plane.dtype, np.floating):
+        return plane[np.isfinite(plane)]
+    return plane
+
+
+def _above(plane: np.ndarray, lo: float) -> float:
+    """The smallest usable max over lo for a flat plane: one gray level for
+    integers, a step scaled to the values for floats (0–1 data must not get
+    a window reaching 1 above its minimum)."""
+    if np.issubdtype(plane.dtype, np.floating):
+        return lo + max(abs(lo) * 1e-3, 1e-6)
+    return lo + 1
+
+
 def auto_range(plane: np.ndarray) -> tuple[float, float]:
     """Fiji-style auto contrast: clip ~0.35% of pixels at each end."""
+    plane = _finite(plane)
+    if plane.size == 0:
+        return 0.0, 1.0
     lo, hi = np.percentile(plane, [0.35, 99.65])
     if hi <= lo:
         lo = float(plane.min())
-        hi = float(max(plane.max(), lo + 1))
+        hi = float(max(plane.max(), _above(plane, lo)))
     return float(lo), float(hi)
 
 
@@ -48,7 +75,10 @@ def full_range(dtype: np.dtype, plane: np.ndarray | None = None) -> tuple[float,
         info = np.iinfo(dtype)
         return float(info.min), float(info.max)
     if plane is not None:
-        return float(plane.min()), float(max(plane.max(), plane.min() + 1))
+        plane = _finite(plane)
+        if plane.size:
+            lo = float(plane.min())
+            return lo, float(max(plane.max(), _above(plane, lo)))
     return 0.0, 1.0
 
 
@@ -62,6 +92,12 @@ class TiffStack:
     composite: bool  # whether to blend channels like Fiji's composite mode
     labels: list[str] | None  # per-page slice labels, ImageJ order (t, z, c)
     version: int = 0  # bumped on display-range edits; render caches key on it
+    # ImageJ mode written while composite is off: the file's own "color" or
+    # "grayscale", so a Fiji "color" hyperstack round-trips as one.
+    plain_mode: str = "grayscale"
+
+    def __post_init__(self):
+        _open_stacks[id(self)] = self
 
     @property
     def n_frames(self) -> int:
@@ -148,31 +184,60 @@ class TiffStack:
                 idx = img
             else:
                 scaled = (img.astype(np.float32) - lo) * (255.0 / max(hi - lo, 1e-9))
+                if np.issubdtype(img.dtype, np.floating):
+                    # NaN has no uint8 value (the cast is platform-dependent):
+                    # render it as the bottom of the range, like Fiji.
+                    scaled = np.nan_to_num(scaled, copy=False, nan=0.0)
                 idx = np.clip(scaled, 0, 255).astype(np.uint8)
             acc += self.luts[ci][idx]
         return np.clip(acc, 0, 255).astype(np.uint8)
 
     def save(self, path: str | Path):
         """Write as an ImageJ hyperstack TIFF that Fiji opens with LUTs/ranges intact."""
-        path = Path(path)
-        if isinstance(self.data, np.memmap) and path == self.path:
-            # Detach from the file we are about to overwrite.
-            self.data = np.array(self.data)
+        path = Path(os.path.abspath(path))
+        # Truncating a file under a live memory map destroys it: this stack
+        # after an earlier Save As, or another copy of the same file.
+        _detach_from(path)
         data = np.asarray(self.data)
         if data.dtype not in (np.uint8, np.uint16, np.float32):
             # The ImageJ format only supports these; float64/int32 etc. are demoted.
             data = data.astype(np.float32)
         metadata = {
             "axes": AXES_ORDER,
-            "mode": "composite" if self.composite else "grayscale",
+            # Channels shown one at a time appear in their LUT colors, which
+            # is Fiji's "color" mode; a single channel keeps the file's mode.
+            "mode": (
+                "composite" if self.composite
+                else "color" if self.n_channels > 1
+                else self.plain_mode
+            ),
             "Ranges": tuple(float(v) for v in self.ranges.ravel()),
             "LUTs": [np.ascontiguousarray(lut.T) for lut in self.luts],
         }
+        if self.n_channels == 1:
+            # Fiji keeps a single-channel display range in min=/max=.
+            metadata["min"], metadata["max"] = (float(v) for v in self.ranges[0])
         if self.labels and len(self.labels) == self.n_frames * self.n_slices * self.n_channels:
             metadata["Labels"] = self.labels
         tifffile.imwrite(path, data, imagej=True, metadata=metadata)
         self.path = path
         self.name = path.name
+
+
+def _detach_from(path: Path):
+    """Copy into RAM every open stack whose memory map reads from path."""
+    if not path.exists():
+        return
+    for stack in list(_open_stacks.values()):
+        mapped = getattr(stack.data, "filename", None)
+        if not isinstance(stack.data, np.memmap) or not mapped:
+            continue
+        try:
+            same = os.path.samefile(mapped, path)
+        except OSError:  # the mapped file is gone; nothing to protect
+            continue
+        if same:
+            stack.data = np.array(stack.data)
 
 
 def _normalize_axes(data: np.ndarray, axes: str) -> np.ndarray:
@@ -204,34 +269,60 @@ def needs_decode(path: str | Path) -> bool:
 
 
 def load_stack(path: str | Path) -> TiffStack:
-    path = Path(path)
+    # Absolute, so a relative argv path still says where the file is — but
+    # not symlink-resolved: a link keeps its own name in headers, labels and
+    # export names. Code that asks "same file?" resolves or uses samefile.
+    path = Path(os.path.abspath(path))
     with tifffile.TiffFile(path) as tf:
         series = tf.series[0]
         axes = series.axes
         ij = tf.imagej_metadata or {}
+        page = tf.pages[0]
+        palette = page.photometric == tifffile.PHOTOMETRIC.PALETTE
+        colormap = page.colormap if palette else None
         try:
             # Uncompressed contiguous files (the normal Fiji case) are
-            # memory-mapped so multi-GB stacks open instantly.
-            data = tifffile.memmap(path)
+            # memory-mapped so multi-GB stacks open instantly — read-only,
+            # so read-only files open too and nothing can write through.
+            data = tifffile.memmap(path, mode="r")
             data = data.reshape(series.shape)
-        except ValueError:
+        except (ValueError, OSError):
             data = series.asarray()
+    rgb = "S" in axes.upper() and "C" not in axes.upper()
     data = _normalize_axes(data, axes)
     n_channels = data.shape[2]
 
-    luts = _load_luts(ij, n_channels)
+    luts = _load_luts(ij, n_channels, colormap)
     ranges = _load_ranges(ij, data)
-    composite = ij.get("mode") == "composite" and n_channels > 1
+    if (
+        n_channels == 1 and colormap is not None and ij.get("LUTs") is None
+        and "Ranges" not in ij and "min" not in ij
+    ):
+        # A palette maps each pixel value to its own color: without a saved
+        # display range, pin the window to the palette's domain so value v
+        # shows entry v (the LUT samples that whole domain).
+        ranges[0] = (0, colormap.shape[1] - 1)
+    # RGB samples are red/green/blue channels, meant to be seen together.
+    composite = (ij.get("mode") == "composite" or rgb) and n_channels > 1
+    plain_mode = "color" if ij.get("mode") == "color" else "grayscale"
     labels = ij.get("Labels")
-    return TiffStack(path, path.name, data, luts, ranges, composite, labels)
+    return TiffStack(
+        path, path.name, data, luts, ranges, composite, labels, plain_mode=plain_mode
+    )
 
 
-def _load_luts(ij: dict, n_channels: int) -> np.ndarray:
+def _load_luts(ij: dict, n_channels: int, colormap: np.ndarray | None = None) -> np.ndarray:
     luts = np.empty((n_channels, 256, 3), dtype=np.uint8)
     embedded = ij.get("LUTs")
+    if embedded is not None:
+        embedded = np.asarray(embedded)
+        if embedded.ndim == 2:  # tifffile hands back a lone LUT unwrapped
+            embedded = embedded[None]
     for c in range(n_channels):
         if embedded is not None and c < len(embedded):
             luts[c] = np.asarray(embedded[c]).T  # (3, 256) -> (256, 3)
+        elif n_channels == 1 and colormap is not None:
+            luts[c] = _palette_lut(colormap)
         elif n_channels == 1:
             luts[c] = _ramp_lut((1.0, 1.0, 1.0))
         else:
@@ -239,11 +330,25 @@ def _load_luts(ij: dict, n_channels: int) -> np.ndarray:
     return luts
 
 
+def _palette_lut(colormap: np.ndarray) -> np.ndarray:
+    """A TIFF ColorMap (3, 2**bits) of 16-bit entries — how 8-bit files carry
+    a LUT — as a (256, 3) uint8 LUT."""
+    cmap = np.asarray(colormap)
+    if cmap.shape[1] != 256:  # e.g. a 16-bit palette: sample 256 entries
+        cmap = cmap[:, np.linspace(0, cmap.shape[1] - 1, 256).astype(int)]
+    if cmap.max() > 255:
+        cmap = cmap >> 8
+    return np.ascontiguousarray(cmap.T).astype(np.uint8)
+
+
 def _load_ranges(ij: dict, data: np.ndarray) -> np.ndarray:
     n_channels = data.shape[2]
     embedded = ij.get("Ranges")
     if embedded is not None and len(embedded) >= 2 * n_channels:
         return np.asarray(embedded, dtype=np.float64).reshape(-1, 2)[:n_channels].copy()
+    if n_channels == 1 and "min" in ij and "max" in ij:
+        # Fiji's display range for a single-channel image.
+        return np.array([[float(ij["min"]), float(ij["max"])]])
     if data.dtype == np.uint8:
         return np.tile([0.0, 255.0], (n_channels, 1))
     # No stored display range: auto-contrast each channel from a middle plane.
@@ -304,4 +409,7 @@ def project(stack: TiffStack, axis: str, method: str, start: int, stop: int) -> 
             ranges[c] = auto_range(arr[t_mid, z_mid, c])
 
     name = f"{_PROJ_PREFIX[method]}_{stack.name}"
-    return TiffStack(None, name, arr, stack.luts.copy(), ranges, stack.composite, None)
+    return TiffStack(
+        None, name, arr, stack.luts.copy(), ranges, stack.composite, None,
+        plain_mode=stack.plain_mode,
+    )

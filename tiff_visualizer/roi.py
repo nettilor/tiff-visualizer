@@ -15,7 +15,7 @@ import math
 import numpy as np
 import pyqtgraph as pg
 import shiboken6
-from PySide6.QtCore import QObject, QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QObject, QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QImage, QPainter, QPainterPath
 from PySide6.QtWidgets import QGraphicsPathItem
 
@@ -186,16 +186,38 @@ class Selection:
     def _set_roi(self, item):
         self.clear()
         self.viewbox.addItem(item, ignoreBounds=True)
-        item.sigRemoveRequested.connect(lambda *_: self.clear())
+        item.sigRemoveRequested.connect(lambda *_: self._remove_later(item))
         # Like Fiji, only a shape tool moves a selection by dragging inside
         # it; the hand always pans, even over a whole-image selection.
         item.translatable = tool() != "hand"
         self.roi = item
 
+    def _remove_later(self, item):
+        """Right-click > Remove ROI: clear once the ROI's own signal has
+        returned, since clear() frees the item."""
+        def remove():
+            if self.roi is item:
+                self.clear()
+
+        QTimer.singleShot(0, self.viewbox, remove)
+
     def clear(self):
         if self.roi is not None:
-            self.viewbox.removeItem(self.roi)
-            self.roi = None
+            old, self.roi = self.roi, None
+            # Cleared mid-drag (Esc, Select None): the scene must stop
+            # sending the drag to the ROI or its handle once they are freed.
+            scene = old.scene()
+            item = getattr(scene, "dragItem", None)
+            while item is not None:
+                if item is old:
+                    scene.dragItem = None
+                    break
+                item = item.parentItem()
+            self.viewbox.removeItem(old)
+            # The ROI and its handles reference each other; left to the
+            # cycle collector they are freed in an unsafe order (a segfault
+            # at some later allocation), so free the item right away.
+            shiboken6.delete(old)
 
     def set_rect(self, x, y, w, h, ellipse: bool = False):
         """A whole-pixel rectangle/ellipse clipped to the image; nothing
@@ -223,6 +245,12 @@ class Selection:
         self.set_rect(0, 0, w, h)
 
     def _path(self) -> QPainterPath:
+        if self.roi.kind == "ellipse":
+            # pg's EllipseROI.shape() is a 24-point polygon (for hit tests);
+            # measure, describe and save the true ellipse it paints.
+            path = QPainterPath()
+            path.addEllipse(self.roi.boundingRect())
+            return self.roi.mapToView(path)
         return self.roi.mapToView(self.roi.shape())
 
     def describe(self) -> str:
@@ -232,9 +260,10 @@ class Selection:
 
     def values(self, plane: np.ndarray):
         """(pixel values inside the selection, pixel count, description) for
-        one plane, or None when the selection lies outside the image."""
+        one plane, or None when the selection lies outside the image. Like
+        Fiji, NaN pixels are left out of both the statistics and the area."""
         if self.roi is None:
-            return plane.ravel(), plane.size, "whole image"
+            return (*_measurable(plane.ravel()), "whole image")
         region = self.mask()
         if region is None:
             return None
@@ -242,7 +271,7 @@ class Selection:
         values = plane[ys, xs][mask]
         if values.size == 0:
             return None
-        return values, int(values.size), self.describe()
+        return (*_measurable(values), self.describe())
 
     def mask(self):
         """((y slice, x slice), bool mask) covering the selection's bounding
@@ -428,6 +457,15 @@ class Selection:
     def _show_preview(self, path: QPainterPath):
         self._preview.setPath(path)
         self._preview.show()
+
+
+def _measurable(values: np.ndarray) -> tuple[np.ndarray, int]:
+    """(values to take statistics of, pixel count) without NaN pixels; an
+    all-NaN region keeps its values, so its statistics read NaN, not an error."""
+    if not np.issubdtype(values.dtype, np.floating):
+        return values, int(values.size)
+    finite = values[~np.isnan(values)]
+    return (finite if finite.size else values), int(finite.size)
 
 
 def _dedupe(points) -> list[tuple[float, float]]:

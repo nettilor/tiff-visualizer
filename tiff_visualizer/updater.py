@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -129,16 +130,28 @@ class Release:
             mine, theirs = ("linux",), ("mac", "osx", "darwin", "win")
             suffixes = (".appimage", ".tar.gz", ".zip")
 
+        def names(low: str, markers) -> bool:
+            # Whole words, so "darwin" is not read as "win"; a word may run
+            # on past the marker (macos, windows, win64, linux64).
+            return any(w.startswith(markers) for w in re.split(r"[^a-z0-9]+", low))
+
         def rank(name: str) -> tuple[int, int] | None:
             low = name.lower()
-            if any(t in low for t in theirs):
+            # Refusal matches substrings, so a run-together TIFFVisualizerWin64
+            # is still refused — after dropping this platform's own markers
+            # that hold another's ("darwin" contains "win").
+            probe = low
+            for marker in mine:
+                if any(t in marker for t in theirs):
+                    probe = probe.replace(marker, "")
+            if any(t in probe for t in theirs):
                 return None
             for i, suffix in enumerate(suffixes):
                 if low.endswith(suffix):
                     # The suffix order above decides first (a .dmg is a better
                     # answer than any .zip), and a name that says "macos" only
                     # breaks ties between equals.
-                    return (i, 0 if any(m in low for m in mine) else 1)
+                    return (i, 0 if names(low, mine) else 1)
             return None
 
         ranked = [(r, a) for a in self.assets if (r := rank(a[0])) is not None]
@@ -287,6 +300,7 @@ def open_in_browser(url: str):
 _pool: ThreadPoolExecutor | None = None
 _bridge: "_Bridge | None" = None
 _in_flight = False
+_answer_owed = False  # the menu asked while the launch check was still out
 
 
 class _Bridge(QObject):
@@ -329,8 +343,11 @@ def check_now():
 
 
 def _check(manual: bool):
-    global _in_flight
+    global _in_flight, _answer_owed
     if _in_flight:
+        # One request at a time, but a manual one riding on the launch check
+        # still gets its answer out loud when that check comes back.
+        _answer_owed = _answer_owed or manual
         return
     _in_flight = True
     # The attempt is what is stamped, not the success — a Mac that is offline
@@ -348,8 +365,10 @@ def _check(manual: bool):
 
 
 def _on_checked(release: Release | None, error: Exception | None, manual: bool):
-    global _in_flight
+    global _in_flight, _answer_owed
     _in_flight = False
+    manual = manual or _answer_owed
+    _answer_owed = False
     if release is None:
         if manual:
             _say_check_failed(error)

@@ -38,7 +38,16 @@ from . import settings as app_settings
 from . import stack_io
 from . import viewer
 from .stack_io import TiffStack
-from .viewer import DimBar, FileDropMixin, StackPane, StackWindow, build_menus
+from .viewer import (
+    AxisRange,
+    DimBar,
+    FileDropMixin,
+    StackPane,
+    StackWindow,
+    build_menus,
+    caption_lines,
+    position_caption,
+)
 
 _workspace: "WorkspaceWindow | None" = None
 
@@ -75,7 +84,12 @@ def export_montage(parent=None):
 
 
 def shared_axes() -> bool:
-    return _workspace is not None and _workspace.shared_checkbox.isChecked()
+    if _workspace is None:
+        return False
+    try:
+        return _workspace.shared_checkbox.isChecked()
+    except RuntimeError:  # C++ side already deleted during app shutdown
+        return False
 
 
 def set_shared_axes(on: bool):
@@ -225,10 +239,29 @@ class MontageDialog(QDialog):
             self.scale_combo.addItem(label, factor)
         self.labels_box = QCheckBox("Stack names above tiles")
         self.labels_box.setChecked(True)
+        self.info_box = QCheckBox("Channel, z and t above tiles")
+        self.info_box.setToolTip(
+            "Each tile's channels, z slice and t frame, e.g. c 1+2  z 5  t 12 —\n"
+            "z shows the projection (z MIP, z AVG, …) when it is on, and GIF\n"
+            "frames follow the movie's position"
+        )
+        self.info_box.setChecked(True)
         form.addRow("Frame:", self.mode_combo)
+        # A GIF's range along its axis, over the longest stack: tiles past
+        # their own end show black "no image" frames.
+        self.ranges: dict[str, AxisRange] = {}
+        offered = [self.mode_combo.itemData(i) for i in range(self.mode_combo.count())]
+        for letter, count in (
+            ("T", max(p.stack.n_frames for p in panes)),
+            ("Z", max(p.stack.n_slices for p in panes)),
+        ):
+            if ("gif", letter) in offered:
+                self.ranges[letter] = AxisRange(count)
+                form.addRow(f"{letter.lower()} range:", self.ranges[letter])
         form.addRow("Frames/second:", self.fps_spin)
         form.addRow("Resolution:", self.scale_combo)
         form.addRow("", self.labels_box)
+        form.addRow("", self.info_box)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -240,27 +273,41 @@ class MontageDialog(QDialog):
             "fps": self.fps_spin,
             "scale": self.scale_combo,
             "labels": self.labels_box,
+            "info": self.info_box,
         }
+        for letter, rng in self.ranges.items():
+            self._remembered[f"{letter.lower()}Range"] = rng
         app_settings.restore_widgets("gridMontage", self._remembered)
+        self._on_mode()
 
     def accept(self):
         app_settings.save_widgets("gridMontage", self._remembered)
         super().accept()
 
-    def _on_mode(self, *_):
-        is_gif = self.mode_combo.currentData()[0] == "gif"
-        self.fps_spin.setEnabled(is_gif)
-        if is_gif and self.scale_combo.currentData() == 1:
-            self.scale_combo.setCurrentIndex(1)  # GIFs default to half size
-
-    def values(self) -> tuple[str, str | None, int, int, bool]:
+    def _on_mode(self, index=None):
         kind, axis = self.mode_combo.currentData()
+        is_gif = kind == "gif"
+        self.fps_spin.setEnabled(is_gif)
+        for letter, rng in self.ranges.items():
+            rng.setEnabled(letter == axis)
+        # A user's switch to a GIF defaults to half size; the call that
+        # syncs the enabled state after restoring leaves the scale alone.
+        if index is not None and is_gif and self.scale_combo.currentData() == 1:
+            self.scale_combo.setCurrentIndex(1)
+
+    def values(self) -> tuple[str, str | None, int, int, bool, bool, tuple[int, int] | None]:
+        """(kind, axis, fps, scale, names, channel/z/t, (first, last)
+        frames along the GIF's axis, 0-based — None for a PNG)."""
+        kind, axis = self.mode_combo.currentData()
+        rng = self.ranges.get(axis)
         return (
             kind,
             axis,
             self.fps_spin.value(),
             self.scale_combo.currentData(),
             self.labels_box.isChecked(),
+            self.info_box.isChecked(),
+            rng.values() if rng else None,
         )
 
 
@@ -347,11 +394,17 @@ class WorkspaceWindow(FileDropMixin, QMainWindow):
         self.minimal_checkbox = QCheckBox("Minimalist")
         self.minimal_checkbox.setToolTip(
             "Maximal visualization efficiency: shared axes, only name + info\n"
-            "above each image, no per-tile buttons, tiles packed tightly."
+            "above each image, no per-tile buttons, tiles packed tightly.\n"
+            "Turning Shared axes off leaves it."
         )
         self.minimal_checkbox.setFocusPolicy(Qt.NoFocus)
         self.minimal_checkbox.toggled.connect(self._apply_minimal)
         controls.addWidget(self.minimal_checkbox)
+        # Minimalist is built on shared axes (its tiles have no bars), so
+        # switching them off — checkbox or Cmd+Shift+G — leaves it as well.
+        self.shared_checkbox.toggled.connect(
+            lambda on: on or self.minimal_checkbox.setChecked(False)
+        )
         # Appears only once a tile is flagged (F), so it costs no space before.
         self.flag_checkbox = QCheckBox("★ only")
         self.flag_checkbox.setToolTip(
@@ -440,7 +493,13 @@ class WorkspaceWindow(FileDropMixin, QMainWindow):
 
     def add_panes(self, panes: list[StackPane]):
         """Add many panes with a single relayout (adding one at a time is O(n²))."""
-        channel_source = self.active_pane if self.panes else None
+        # Shared channels: joining panes adopt the grid's channel state; a
+        # grid starting empty takes it from the stack last worked on.
+        if self.panes:
+            channel_source = self.active_pane
+        else:
+            focused = viewer.active_pane()
+            channel_source = focused if focused in panes else (panes[0] if panes else None)
         for pane in panes:
             self.panes.append(pane)
             pane.set_tiled(True)
@@ -468,7 +527,6 @@ class WorkspaceWindow(FileDropMixin, QMainWindow):
         if self.minimal_checkbox.isChecked():
             for pane in panes:
                 pane.set_minimal(True)
-        # New panes adopt the existing shared channel state, not the reverse.
         if self.shared_channels_checkbox.isChecked() and channel_source is not None:
             self._propagate_channels(channel_source)
 
@@ -506,6 +564,7 @@ class WorkspaceWindow(FileDropMixin, QMainWindow):
         """One rebuild for any number of removals (relayout is O(panes))."""
         if self.active_pane not in self.panes:
             self._set_active(self.panes[0] if self.panes else None)
+        self._update_flag_ui()  # the last flagged tile may have left
         self._relayout()
         self._update_title()
         self._apply_shared_mode()
@@ -518,8 +577,7 @@ class WorkspaceWindow(FileDropMixin, QMainWindow):
         self.panes.remove(source)
         index = self.panes.index(target) + (1 if after else 0)
         self.panes.insert(index, source)
-        if self.sort_combo.currentData() == "name":
-            self.sort_combo.setCurrentIndex(0)  # a manual drag ends name order
+        self.sort_combo.setCurrentIndex(0)  # a manual drag ends any sorted order
         self._relayout()
 
     def close_pane(self, pane: StackPane):
@@ -636,7 +694,8 @@ class WorkspaceWindow(FileDropMixin, QMainWindow):
         for pane in self.panes:
             if on:
                 pane.shared_controller = self
-                pane.set_bars_visible(False)
+                # A locked tile keeps navigating on its own bars.
+                pane.set_bars_visible(pane.shared_locked)
             else:
                 pane.clear_shared()
         if on:
@@ -647,6 +706,14 @@ class WorkspaceWindow(FileDropMixin, QMainWindow):
 
     def _rebuild_shared_bars(self):
         old = {letter: bar.value() for letter, bar in self.shared_bars.items()}
+        # Tiles joining or leaving must not stop playback or reset its speed.
+        playback = {
+            letter: (bar.play_button.isChecked(), bar._fps)
+            for letter, bar in self.shared_bars.items()
+            if bar.play_button is not None
+        }
+        for bar in self.shared_bars.values():
+            bar.stop_playback()  # the old bar lives until deleteLater runs
         while self.shared_bars_layout.count():
             item = self.shared_bars_layout.takeAt(0)
             if item.widget():
@@ -674,6 +741,11 @@ class WorkspaceWindow(FileDropMixin, QMainWindow):
                 else:
                     self.shared_bars_layout.addWidget(bar)
                 self.shared_bars[letter] = bar
+                if letter in playback:
+                    playing, fps = playback[letter]
+                    bar._set_fps(fps)
+                    if playing:
+                        bar.toggle_playback()
         self._update_shared_channel_boxes()
         self.shared_bars_box.setVisible(bool(self.shared_bars))
 
@@ -845,34 +917,77 @@ class WorkspaceWindow(FileDropMixin, QMainWindow):
 
     # ---- grid montage export -------------------------------------------
 
-    def _montage_image(self, panes, scale=1, labels=True, t=None, z=None):
+    def _montage_image(self, panes, scale=1, labels=True, t=None, z=None, info=False):
         """One montage frame: the given panes in grid order, each rendered at
         full resolution with its current contrast/channels/projection, labeled and
-        letterboxed into equal cells. t/z override the position per axis."""
+        letterboxed into equal cells. t/z override the position per axis.
+        ``info`` adds each tile's channels, z (or projection) and t to its
+        label, on a second line when name and position don't fit one."""
         from PIL import Image, ImageDraw, ImageFont
 
         cell_w = max(p.stack.shape_yx[1] for p in panes) // scale
         cell_h = max(p.stack.shape_yx[0] for p in panes) // scale
-        label_h = max(16, cell_h // 16) if labels else 0
+        line_h = max(16, cell_h // 16)
         cols = self._grid_cols(len(panes))
         rows = math.ceil(len(panes) / cols)
-        canvas = Image.new("RGB", (cols * cell_w, rows * (cell_h + label_h)), (0, 0, 0))
-        draw = ImageDraw.Draw(canvas)
         try:
-            font = ImageFont.load_default(size=max(11, int(label_h * 0.7)))
+            font = ImageFont.load_default(size=max(11, int(line_h * 0.7)))
         except TypeError:  # Pillow < 10 has no sized default font
             font = ImageFont.load_default()
+
+        def position(pane, t_, z_, channels=None):
+            proj = pane._proj_abbrev() if pane._mip_on() else None
+            channels = pane._display_channels() if channels is None else channels
+            return position_caption(pane.stack, channels, t_, z_, proj)
+
+        def too_wide(pane):
+            name = pane.stack.name if labels else ""
+            widest = position(pane, pane.stack.n_frames - 1, pane.stack.n_slices - 1)
+            return any(
+                font.getlength(line) > cell_w - 12
+                for where in (widest, "no image")
+                for line in caption_lines(name, where)
+            )
+
+        # One layout for every tile and every frame of a GIF, so the sheet
+        # never changes size: split when any tile's widest label — at its
+        # last t/z, the most digits — would overflow its cell.
+        split = info and any(too_wide(p) for p in panes)
+        n_lines = (2 if split and labels else 1) if (labels or info) else 0
+        label_h = line_h * n_lines
+        canvas = Image.new("RGB", (cols * cell_w, rows * (cell_h + label_h)), (0, 0, 0))
         for i, pane in enumerate(panes):
             cx = (i % cols) * cell_w
             cy = (i // cols) * (cell_h + label_h)
-            if labels:
-                draw.text((cx + 6, cy + 2), pane.stack.name, fill=(215, 215, 215), font=font)
             s = pane.stack
-            if t is not None and t >= s.n_frames:
-                continue  # black cell, like shared-axes out-of-range tiles
-            if z is not None and not pane._mip_on() and z >= s.n_slices:
+            # The position the tile shows — the shared one while it follows
+            # the grid, not its bars, which hold the last in-range position
+            # while it is blank — with the frame's axis overridden.
+            pane_t, pane_z, pane_c = pane._displayed_position()
+            shown_t = pane_t if t is None else t
+            shown_z = pane_z if z is None else z
+            channels = pane._display_channels() if pane._composite_on() else [pane_c]
+            # Out-of-range frames stay black, like shared-axes out-of-range tiles.
+            blank = (
+                shown_t >= s.n_frames
+                or (not pane._mip_on() and shown_z >= s.n_slices)
+                or (not pane._composite_on() and pane_c >= s.n_channels)
+            )
+            if label_h:
+                where = (
+                    "no image" if blank else position(pane, shown_t, shown_z, channels)
+                ) if info else ""
+                strip = Image.new("RGB", (cell_w, label_h), (0, 0, 0))  # clips long names
+                draw = ImageDraw.Draw(strip)
+                lines = caption_lines(s.name if labels else "", where, split)
+                for k, line in enumerate(lines):
+                    draw.text((6, 2 + k * line_h), line, fill=(215, 215, 215), font=font)
+                canvas.paste(strip, (cx, cy))
+            if blank:
                 continue
-            tile = Image.fromarray(pane._full_res_rgb(t=t, z=z))
+            tile = Image.fromarray(
+                pane._full_res_rgb(t=shown_t, z=min(shown_z, s.n_slices - 1), channels=channels)
+            )
             if scale > 1:
                 tile = tile.resize(
                     (max(tile.width // scale, 1), max(tile.height // scale, 1)), Image.LANCZOS
@@ -886,7 +1001,7 @@ class WorkspaceWindow(FileDropMixin, QMainWindow):
         from PIL import Image
 
         from . import settings as app_settings
-        from .viewer import _show_status
+        from .viewer import _export_failed, _show_status
 
         panes = self._displayed_panes()
         if not panes:
@@ -894,9 +1009,11 @@ class WorkspaceWindow(FileDropMixin, QMainWindow):
         dialog = MontageDialog(self, panes)
         if dialog.exec() != QDialog.Accepted:
             return
-        kind, axis, fps, scale, labels = dialog.values()
+        kind, axis, fps, scale, labels, info, frame_range = dialog.values()
         suffix = "png" if kind == "png" else "gif"
         default = f"montage.{suffix}" if axis is None else f"montage_{axis}.{suffix}"
+        if axis is not None and dialog.ranges[axis].narrowed():
+            default = f"montage_{axis.lower()}{dialog.ranges[axis].span()}.{suffix}"
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Export grid montage",
@@ -907,17 +1024,20 @@ class WorkspaceWindow(FileDropMixin, QMainWindow):
             return
         app_settings.set_last_dir(str(Path(path).parent))
         if kind == "png":
-            self._montage_image(panes, scale, labels).save(path)
-            _show_status(f"Exported montage of {len(panes)} stacks to {path}", 5000)
+            try:
+                self._montage_image(panes, scale, labels, info=info).save(path)
+            except (OSError, ValueError) as exc:
+                _export_failed(self, path, exc)
+                return
+            _show_status(f"Exported montage of {len(panes)} stacks to {path}", 5000, near=self)
             return
-        count = max(
-            (p.stack.n_frames if axis == "T" else p.stack.n_slices) for p in panes
-        )
+        first, last = frame_range
+        count = last - first + 1
         progress = QProgressDialog(f"Rendering {count} montage frames…", "Cancel", 0, count, self)
         progress.setWindowModality(Qt.WindowModal)
         frames = []
-        for i in range(count):
-            progress.setValue(i)
+        for n, i in enumerate(range(first, last + 1)):
+            progress.setValue(n)
             QApplication.processEvents()
             if progress.wasCanceled():
                 return
@@ -925,19 +1045,24 @@ class WorkspaceWindow(FileDropMixin, QMainWindow):
                 panes, scale, labels,
                 t=i if axis == "T" else None,
                 z=i if axis == "Z" else None,
+                info=info,
             )
             # Quantize per frame immediately: a full-RGB frame list for 48
             # tiles over a long t range would not fit in RAM.
             frames.append(frame.convert("P", palette=Image.ADAPTIVE))
         progress.setValue(count)
-        frames[0].save(
-            path,
-            save_all=True,
-            append_images=frames[1:],
-            duration=max(int(1000 / fps), 20),
-            loop=0,
-        )
-        _show_status(f"Exported {count} montage frames to {path}", 5000)
+        try:
+            frames[0].save(
+                path,
+                save_all=True,
+                append_images=frames[1:],
+                duration=max(int(1000 / fps), 20),
+                loop=0,
+            )
+        except (OSError, ValueError) as exc:
+            _export_failed(self, path, exc)
+            return
+        _show_status(f"Exported {count} montage frames to {path}", 5000, near=self)
 
     # ---- active pane ---------------------------------------------------
 

@@ -10,6 +10,14 @@ def settings() -> QSettings:
     return QSettings("SwartzLab", "TIFF Visualizer")
 
 
+def _combo_entry(combo: QComboBox, index: int) -> str:
+    """What a combo entry is remembered by: its data when it has any, so an
+    entry whose label changes — the stack montage's projection names the
+    pane's method — is still found; else its text."""
+    data = combo.itemData(index)
+    return combo.itemText(index) if data is None else str(data)
+
+
 def restore_widgets(group: str, widgets: dict[str, QWidget]):
     """Reopen a dialog the way it was last accepted: apply the values saved
     by save_widgets(group, …) to these widgets, in dict order. Values that
@@ -22,13 +30,18 @@ def restore_widgets(group: str, widgets: dict[str, QWidget]):
         if not s.contains(key):
             continue
         if isinstance(widget, QComboBox):
-            index = widget.findText(s.value(key, type=str))
-            if index >= 0:
+            saved = s.value(key, type=str)
+            entries = [_combo_entry(widget, i) for i in range(widget.count())]
+            if saved in entries:
+                widget.setCurrentIndex(entries.index(saved))
+            elif (index := widget.findText(saved)) >= 0:  # saved by label before
                 widget.setCurrentIndex(index)
         elif isinstance(widget, QSpinBox):
             widget.setValue(s.value(key, type=int))
         elif isinstance(widget, QCheckBox):
             widget.setChecked(s.value(key, type=bool))
+        elif hasattr(widget, "restore_text"):  # viewer.AxisRange
+            widget.restore_text(s.value(key, type=str))
 
 
 def save_widgets(group: str, widgets: dict[str, QWidget]):
@@ -41,11 +54,13 @@ def save_widgets(group: str, widgets: dict[str, QWidget]):
         key = f"dialogs/{group}/{name}"
         if isinstance(widget, QComboBox):
             if widget.count() > 1:
-                s.setValue(key, widget.currentText())
+                s.setValue(key, _combo_entry(widget, widget.currentIndex()))
         elif isinstance(widget, QSpinBox):
             s.setValue(key, widget.value())
         elif isinstance(widget, QCheckBox):
             s.setValue(key, widget.isChecked())
+        elif hasattr(widget, "remembered_text"):  # viewer.AxisRange
+            s.setValue(key, widget.remembered_text())
 
 
 def last_dir() -> str:

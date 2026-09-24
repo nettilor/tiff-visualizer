@@ -2,17 +2,18 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, Qt
+from PySide6.QtCore import QEvent, Qt, QTimer
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
 from . import control_panel
 from .control_panel import get_control_window
 from .theme import apply_dark_theme
-from .viewer import open_path
+from .viewer import open_paths
 
 
 class ReopenDetector:
@@ -36,6 +37,37 @@ class ReopenDetector:
         return reopened
 
 
+class OpenBatcher:
+    """Finder and the Dock hand a multi-file open over as one FileOpen event
+    per file. Gather the burst and open it in one go — one grid relayout, one
+    error report — instead of stack by stack."""
+
+    def __init__(self, open_many, delay_ms: int = 100):
+        self._paths: list[str] = []
+        self._open_many = open_many
+        self._timer = QTimer()
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(delay_ms)
+        self._timer.timeout.connect(self.flush)
+
+    def add(self, path: str):
+        self._paths.append(path)
+        self._timer.start()  # restarted by each file, so it fires once the burst ends
+
+    def flush(self):
+        paths, self._paths = self._paths, []
+        if paths:
+            self._open_many(paths)
+
+
+def open_batch(paths):
+    """Open files handed to the app (argv, Finder, the Dock) as one batch.
+    Absolute, so a relative path still says where the file is; the folder
+    lists compare resolved paths, so symlinks match too."""
+    with get_control_window().bulk_update():
+        open_paths([Path(os.path.abspath(p)) for p in paths])
+
+
 class TiffApplication(QApplication):
     """Handles macOS FileOpen events (e.g. `open -a "TIFF Visualizer" x.tif`)
     and dock-icon clicks, which raise the control window back to the front."""
@@ -43,10 +75,11 @@ class TiffApplication(QApplication):
     def __init__(self, argv):
         super().__init__(argv)
         self._reopen = ReopenDetector()
+        self._file_opens = OpenBatcher(open_batch)
 
     def event(self, ev):
         if ev.type() == QEvent.Type.FileOpen and ev.file():
-            open_path(ev.file())
+            self._file_opens.add(ev.file())
             return True
         if ev.type() == QEvent.Type.ApplicationStateChange:
             active = self.applicationState() == Qt.ApplicationState.ApplicationActive
@@ -76,9 +109,7 @@ def main() -> int:
 
     app.aboutToQuit.connect(autosave_session)
 
-    for path in app.arguments()[1:]:
-        open_path(path)
-    control.refresh_state()
+    open_batch(app.arguments()[1:])  # refreshes the control window when done
 
     from . import updater
 

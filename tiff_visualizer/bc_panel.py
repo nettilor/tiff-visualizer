@@ -13,11 +13,13 @@ on the stack, and every change refreshes via the pane's position_changed.
 
 from __future__ import annotations
 
+import math
 import time
+import weakref
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -33,7 +35,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .stack_io import auto_range, full_range
+from shiboken6 import isValid
+
+from .stack_io import auto_range, full_range, project_block
 
 _panel: "BCPanel | None" = None
 
@@ -49,7 +53,9 @@ def show_bc_panel(target) -> "BCPanel":
 
 
 # ---- contrast undo (Cmd+Z) -------------------------------------------
-# Each entry restores one operation: a list of (stack, channel, old_lo, old_hi).
+# Each entry restores one operation: a list of (stack ref, channel, old_lo,
+# old_hi). Weak references, so undo history never keeps a closed stack's
+# data in RAM; steps whose stacks have all closed are skipped.
 _undo_stack: list[list[tuple]] = []
 _MAX_UNDO = 50
 _last_coalesce_key = None
@@ -69,28 +75,71 @@ def push_range_undo(entries: list[tuple], coalesce_key=None):
     ):
         _last_push_time = now
         return  # keep the gesture's original 'before' snapshot
-    _undo_stack.append(list(entries))
+    _undo_stack.append([(weakref.ref(stack), c, lo, hi) for stack, c, lo, hi in entries])
     del _undo_stack[:-_MAX_UNDO]
     _last_coalesce_key = coalesce_key
     _last_push_time = now
 
 
 def undo_last_range_change():
+    """Undo the latest step that still touches an open stack."""
     global _last_coalesce_key
-    if not _undo_stack:
-        return
+    from .viewer import _all_panes
+
     _last_coalesce_key = None
-    entry = _undo_stack.pop()
+    open_stacks = {id(pane.stack) for pane in _all_panes}
+    while _undo_stack:
+        entry = [(ref(), c, lo, hi) for ref, c, lo, hi in _undo_stack.pop()]
+        entry = [e for e in entry if e[0] is not None and id(e[0]) in open_stacks]
+        if entry:
+            break
+    else:
+        return
     touched = set()
     for stack, c, lo, hi in entry:
         stack.ranges[c] = (lo, hi)
         stack.version += 1
         touched.add(id(stack))
-    from .viewer import _all_panes
-
     for pane in _all_panes:
         if id(pane.stack) in touched:
             pane.refresh()
+
+
+# Past this many values a projection's histogram samples every nth pixel,
+# so B&C stays live during playback of big stacks; Auto/Reset use it all.
+_HIST_MAX_VALUES = 16_000_000
+
+
+def displayed_plane(pane, t: int, z: int, c: int, max_values: int | None = None) -> np.ndarray:
+    """Channel c's plane as the pane shows it: its z projection when that is
+    on (like measurement()), otherwise slice z. A Sum projection comes back
+    per slice — the Mean — since render() scales Sum's display window by the
+    slice count, which leaves B&C ranges in single-slice units."""
+    stack = pane.stack
+    if not pane._mip_on():
+        return np.asarray(stack.plane(t, z, c))
+    block = stack.data[t, :, c]
+    if max_values is not None and block.size > max_values:
+        step = math.ceil(math.sqrt(block.size / max_values))
+        block = block[:, ::step, ::step]
+    method = "Mean" if pane.proj_method == "Sum" else pane.proj_method
+    return project_block(np.asarray(block), method)
+
+
+def _float_precision(scale: float) -> tuple[int, float, float]:
+    """(decimals, step, bound) for float min/max boxes showing values of
+    about this magnitude: ~4 significant digits, steps of 1%, and a range
+    far past the data (a fixed ±1e12 would round 0.0012 to 0.00)."""
+    exp = math.floor(math.log10(scale)) if scale > 0 and math.isfinite(scale) else 0
+    return min(max(3 - exp, 2), 8), 10.0 ** (exp - 2), 10.0 ** (exp + 6)
+
+
+def _is_open(pane) -> bool:
+    """Still open: a closed pane has left viewer._all_panes, even while its
+    window or a reference keeps it alive."""
+    from .viewer import _all_panes
+
+    return pane in _all_panes
 
 
 def _ui_color(stack, c: int) -> tuple[int, int, int]:
@@ -109,6 +158,7 @@ class BCControls(QWidget):
     def __init__(self):
         super().__init__()
         self._target = None
+        self._closing: list = []  # closed former targets awaiting Qt's delete
         self._updating = False
 
         layout = QVBoxLayout(self)
@@ -173,12 +223,17 @@ class BCControls(QWidget):
     def set_target(self, pane):
         if self._target is pane:
             return
-        if self._target is not None:
+        old = self._target
+        if old is not None and _is_open(old):
             try:
-                self._target.position_changed.disconnect(self._on_position_changed)
-                self._target.destroyed.disconnect(self._on_target_destroyed)
+                old.position_changed.disconnect(self._on_position_changed)
+                old.destroyed.disconnect(self._on_target_destroyed)
             except RuntimeError:
                 pass
+        elif old is not None:
+            # A closed pane is on its way out (deleteLater pending): its
+            # connections die with it, and it's held until Qt deletes it.
+            self._hold_until_deleted(old)
         self._target = pane
         if pane is None:
             self.channels_box.hide()
@@ -190,8 +245,41 @@ class BCControls(QWidget):
         self.refresh()
 
     def _on_target_destroyed(self, *_):
+        # Only the current target's deletion counts: a former target, whose
+        # connections were left to die with it, must not retarget us.
+        if self._target is None or _is_open(self._target):
+            return
         self._target = None
         self.target_lost.emit()
+
+    def _hold_until_deleted(self, pane):
+        """Keep a closed pane's wrapper until Qt has deleted the pane. A
+        closed tile is unparented with a deleteLater() pending; dropping its
+        last Python reference first would make Python delete it too."""
+        if not isValid(pane):
+            return
+        self._closing.append(pane)
+        pane.destroyed.connect(lambda *_: QTimer.singleShot(0, self._forget_deleted))
+
+    def _forget_deleted(self):
+        self._closing = [p for p in self._closing if isValid(p)]
+
+    def _target_open(self) -> bool:
+        """Whether there is a target that is still open. A closed pane can
+        outlive its window, so being alive isn't enough: once it has left
+        viewer._all_panes the controls drop it (target_lost) rather than
+        keep editing — or applying to all — a stack nobody can see."""
+        if self._target is None:
+            return False
+        if _is_open(self._target):
+            return True
+        # Not set_target(None): hiding the channel rows inside the focus
+        # change a close causes made PySide crash in a later garbage
+        # collection. The retarget on target_lost rebuilds them anyway.
+        self._hold_until_deleted(self._target)  # its connections die with it
+        self._target = None
+        self.target_lost.emit()
+        return False
 
     # ---- channel rows --------------------------------------------------
 
@@ -233,7 +321,8 @@ class BCControls(QWidget):
 
     def _configure_spins(self):
         """Limit the region and spinboxes to the image's value bounds:
-        dtype range for integer images, unbounded for float."""
+        dtype range for integer images, unbounded for float (whose boxes
+        take their precision from the channel's range in refresh())."""
         stack = self._target.stack
         if np.issubdtype(stack.dtype, np.integer):
             info = np.iinfo(stack.dtype)
@@ -245,14 +334,22 @@ class BCControls(QWidget):
                 spin.setSingleStep(1)
         else:
             self.region.setBounds((None, None))
-            for spin in (self.min_spin, self.max_spin):
-                spin.setDecimals(2)
-                spin.setRange(-1e12, 1e12)
-                spin.setSingleStep(1.0)
+
+    def _set_float_precision(self, lo: float, hi: float):
+        decimals, step, bound = _float_precision(max(abs(lo), abs(hi), abs(hi - lo)))
+        for spin in (self.min_spin, self.max_spin):
+            spin.setDecimals(decimals)
+            spin.setRange(-bound, bound)
+            spin.setSingleStep(step)
+
+    def _min_gap(self) -> float:
+        """Smallest max − min allowed: 1 for integer images, one box step
+        (scaled to the data) for float ones."""
+        return self.max_spin.singleStep()
 
     def refresh(self):
         """Sync histogram, region, spins and channel selection from the target."""
-        if self._target is None:
+        if not self._target_open():
             return
         self._updating = True
         try:
@@ -266,33 +363,47 @@ class BCControls(QWidget):
                     item = self.channels_layout.itemAtPosition(ci, 1)
                     if item is not None:
                         item.widget().setChecked(self._target.visible_channels[ci])
-            plane = np.asarray(stack.plane(t, z, c))
-            counts, edges = np.histogram(plane, bins=256)
+            plane = displayed_plane(self._target, t, z, c, _HIST_MAX_VALUES)
+            if not np.issubdtype(plane.dtype, np.integer):
+                plane = plane[np.isfinite(plane)]  # NaN/inf would break the bins
+            lo, hi = (float(v) for v in stack.ranges[c])
+            if not (math.isfinite(lo) and math.isfinite(hi)):
+                # Shown only: a NaN range can't be drawn; editing it stores a real one.
+                lo, hi = (
+                    (float(plane.min()), float(plane.max())) if plane.size else (0.0, 1.0)
+                )
             r, g, b = _ui_color(stack, c)
-            self.hist_curve.setData(
-                edges,
-                counts,
-                stepMode="center",
-                fillLevel=0,
-                brush=pg.mkBrush(r, g, b, 120),
-                pen=pg.mkPen(r, g, b),
-            )
+            if plane.size:
+                counts, edges = np.histogram(plane, bins=256)
+                self.hist_curve.setData(
+                    edges,
+                    counts,
+                    stepMode="center",
+                    fillLevel=0,
+                    brush=pg.mkBrush(r, g, b, 120),
+                    pen=pg.mkPen(r, g, b),
+                )
+                x_range = (min(float(edges[0]), lo), max(float(edges[-1]), hi))
+            else:
+                self.hist_curve.setData([], [])
+                x_range = (lo, hi)
             self.region.setBrush(pg.mkBrush(r, g, b, 40))
 
-            lo, hi = stack.ranges[c]
+            if not np.issubdtype(stack.dtype, np.integer):
+                self._set_float_precision(lo, hi)
             self.region.setRegion((lo, hi))
             self.min_spin.setValue(lo)
             self.max_spin.setValue(hi)
-            self.hist_plot.plotItem.setXRange(
-                min(float(edges[0]), lo), max(float(edges[-1]), hi), padding=0.02
-            )
+            self.hist_plot.plotItem.setXRange(*x_range, padding=0.02)
         finally:
             self._updating = False
 
     def _apply_range(self, lo: float, hi: float):
+        if not self._target_open() or not (math.isfinite(lo) and math.isfinite(hi)):
+            return  # a NaN bound would blank the image and hang the region
         t_, z_, c = self._target.position()
         stack = self._target.stack
-        new = (lo, hi if hi > lo else lo + 1)
+        new = (lo, hi if hi > lo else lo + self._min_gap())
         old = (float(stack.ranges[c][0]), float(stack.ranges[c][1]))
         if old == new:
             return
@@ -302,7 +413,7 @@ class BCControls(QWidget):
         self._target.refresh()
 
     def _on_apply_all(self):
-        if self._target is None:
+        if not self._target_open():
             return
         t_, z_, c = self._target.position()
         lo, hi = self._target.stack.ranges[c]
@@ -333,11 +444,20 @@ class BCControls(QWidget):
         self._apply_range(lo, hi)
 
     def _on_spins_changed(self):
-        if self._updating or self._target is None:
+        if self._updating or not self._target_open():
             return
-        lo, hi = self.min_spin.value(), self.max_spin.value()
+        # Only the edited box's value is taken: the other one shows the
+        # stored bound rounded to its decimals, and writing that back would
+        # shift a bound the user never touched.
+        t_, z_, c = self._target.position()
+        lo, hi = (float(v) for v in self._target.stack.ranges[c])
+        edited = self.sender()
+        if edited is not self.max_spin or not math.isfinite(lo):
+            lo = self.min_spin.value()
+        if edited is not self.min_spin or not math.isfinite(hi):
+            hi = self.max_spin.value()
         if hi <= lo:
-            hi = lo + 1
+            hi = lo + self._min_gap()
         self._updating = True
         self.region.setRegion((lo, hi))
         self._updating = False
@@ -347,19 +467,19 @@ class BCControls(QWidget):
         self.refresh()
 
     def _on_auto(self):
-        if self._target is None:
+        if not self._target_open():
             return
         t, z, c = self._target.position()
-        lo, hi = auto_range(np.asarray(self._target.stack.plane(t, z, c)))
+        lo, hi = auto_range(displayed_plane(self._target, t, z, c))
         self._apply_range(lo, hi)
         self.refresh()
 
     def _on_reset(self):
-        if self._target is None:
+        if not self._target_open():
             return
         t, z, c = self._target.position()
         stack = self._target.stack
-        lo, hi = full_range(stack.dtype, np.asarray(stack.plane(t, z, c)))
+        lo, hi = full_range(stack.dtype, displayed_plane(self._target, t, z, c))
         self._apply_range(lo, hi)
         self.refresh()
 
@@ -404,6 +524,7 @@ class BCPanel(QWidget):
 
     def showEvent(self, ev):
         super().showEvent(ev)
+        self.controls._target_open()  # retargets if its stack closed while hidden
         if not self._sized_square:
             self._sized_square = True
             from . import settings as app_settings
@@ -423,6 +544,9 @@ class BCPanel(QWidget):
         super().hideEvent(ev)
 
     def _on_focus_changed(self, _old, new):
+        # Closing a window moves focus: the moment to let go of its stack,
+        # pinned or not.
+        self.controls._target_open()
         if self.pin_button.isChecked() or new is None:
             return
         from .viewer import StackPane

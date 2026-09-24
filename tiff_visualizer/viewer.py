@@ -299,6 +299,9 @@ class StackPane(QWidget):
         self._plane_cache: OrderedDict = OrderedDict()
         self._prefetch_scheduled = False
         self._render_request = 0  # invalidates in-flight async renders
+        self._inflight: dict = {}  # cache key -> submit time, while the pool renders it
+        self._awaited_key = None  # an in-flight key the current refresh shows on landing
+        self._probe_pos = None  # scene position of the last pixel readout
         self.setFocusPolicy(Qt.StrongFocus)
         self.setMinimumSize(240, 220)
         self.setAcceptDrops(True)  # pane-reorder drags; file drops pass through
@@ -447,6 +450,7 @@ class StackPane(QWidget):
 
         self.viewbox.wheel_stepped.connect(self._step)
         self.view.scene().sigMouseMoved.connect(self._on_mouse_moved)
+        self.view.viewport().installEventFilter(self)
 
         self._last_stride = 1
         self._clamping_zoom = False
@@ -459,10 +463,22 @@ class StackPane(QWidget):
         self.viewbox.sigRangeChanged.connect(self._maybe_restride)
         _all_panes.append(self)
 
+    @property
+    def shared_controller(self):
+        return self._shared_controller
+
+    @shared_controller.setter
+    def shared_controller(self, controller):
+        # The lock only means something while shared axes drive this tile.
+        self._shared_controller = controller
+        if hasattr(self, "lock_button"):
+            self._apply_chrome()
+
     def set_tiled(self, tiled: bool):
         self._tiled = tiled
         if not tiled:
-            self.lock_button.setChecked(False)
+            # Any lock ends in clear_shared(), which follows once the tile
+            # has left the grid, so a floated tile keeps its own position.
             self._minimal = False
         # Tiles accept a smaller minimum than floating windows; past that the
         # workspace grid scrolls rather than forcing the window off-screen.
@@ -485,8 +501,9 @@ class StackPane(QWidget):
     def _apply_chrome(self):
         tiled, minimal = self._tiled, self._minimal
         self.title_label.setVisible(tiled)
-        for widget in (self.float_button, self.close_button, self.lock_button):
+        for widget in (self.float_button, self.close_button):
             widget.setVisible(tiled and not minimal)
+        self.lock_button.setVisible(tiled and not minimal and self.shared_controller is not None)
         self.bc_button.setVisible(not minimal)
         self.probe_label.setVisible(not minimal)
         if self.mip_box is not None:
@@ -717,7 +734,10 @@ class StackPane(QWidget):
         self.refresh()
 
     def _step(self, letter: str, delta: int):
-        if self.shared_controller is not None and not self.shared_locked:
+        following = self.shared_controller is not None and not self.shared_locked
+        if letter == "z" and self._mip_on() and not following:
+            return  # z is collapsed: moving it would change nothing on screen
+        if following:  # the shared z still drives the grid's slice-showing tiles
             self.shared_controller.shared_step(letter, delta)
         elif letter in self.bars:
             self.bars[letter].step(delta)
@@ -759,19 +779,24 @@ class StackPane(QWidget):
     def clear_shared(self):
         self.shared_controller = None
         self._shared_pos = None
+        # A lock ends with shared axes — detached first, so unlocking can't
+        # snap the tile to the shared position: it stays where it was.
+        self.lock_button.setChecked(False)
         self.set_bars_visible(True)
         self.refresh()
 
     def _sync_shared(self):
-        """Apply the shared position; mark blank where this stack has no image."""
+        """Apply the shared position; mark blank where this stack has no image
+        (a z projection has one at every z)."""
         self._blank = False
         if self.shared_controller is None or self._shared_pos is None or self.shared_locked:
             return
         t, z, c = self._shared_pos
         s = self.stack
-        if t >= s.n_frames or z >= s.n_slices:
+        if t >= s.n_frames or (z >= s.n_slices and not self._mip_on()):
             self._blank = True
             return
+        z = min(z, s.n_slices - 1)
         for letter, value in (("t", t), ("z", z), ("c", min(c, s.n_channels - 1))):
             if letter in self.bars:
                 self.bars[letter].set_value_silent(value)
@@ -779,11 +804,13 @@ class StackPane(QWidget):
             self._blank = True
 
     def _toggle_time_playback(self):
-        """Space: play/pause the time axis (z for stacks without one)."""
+        """Space: play/pause the time axis (z for stacks without one, unless
+        z is collapsed by the projection)."""
         if self.shared_controller is not None and not self.shared_locked:
-            self.shared_controller.toggle_time_playback()
+            if "t" in self.shared_controller.shared_bars or not self._mip_on():
+                self.shared_controller.toggle_time_playback()
             return
-        bar = self.bars.get("t") or self.bars.get("z")
+        bar = self.bars.get("t") or (None if self._mip_on() else self.bars.get("z"))
         if bar is not None:
             bar.toggle_playback()
 
@@ -853,6 +880,8 @@ class StackPane(QWidget):
     def _on_mip_toggled(self, on: bool):
         if "z" in self.bars:
             self.bars["z"].setEnabled(not on)
+            if on:
+                self.bars["z"].stop_playback()
         self.refresh()
 
     def _display_channels(self) -> list[int]:
@@ -910,6 +939,10 @@ class StackPane(QWidget):
 
     def _store_cache(self, key: tuple, rgb: np.ndarray):
         self._plane_cache[key] = rgb
+        self._inflight.pop(key, None)
+        if key == self._awaited_key:  # a prefetch landing with the frame now wanted
+            self._awaited_key = None
+            self._apply_rgb(rgb)
         # Big enough that a whole t-loop stays cached during playback.
         limit = max(16, self.stack.n_frames + 4)
         while len(self._plane_cache) > limit:
@@ -935,8 +968,31 @@ class StackPane(QWidget):
             self._plane_cache.move_to_end(key)
         return rgb
 
+    def _in_flight(self, key: tuple) -> bool:
+        import time
+
+        # A render that failed never lands: stop waiting for it after a while.
+        return time.monotonic() - self._inflight.get(key, -1e9) < 2.0
+
+    def _submit_render(self, t: int, z: int, stride: int, key: tuple, request_id: int):
+        """Render (t, z) in the pool; the result lands in the cache, and on
+        screen only if request_id is still current."""
+        import time
+
+        from . import render_pool
+
+        self._inflight[key] = time.monotonic()
+        render_pool.submit(
+            self,
+            self.stack,
+            (t, z, list(self._display_channels()), stride, self._mip_on(), self.proj_method),
+            key,
+            request_id,
+        )
+
     def refresh(self, *_, async_render: bool = False):
         self._render_request += 1
+        self._awaited_key = None
         self._sync_shared()
         t, z, c = self.position()
         stride = self._render_stride()
@@ -949,39 +1005,59 @@ class StackPane(QWidget):
             if rgb is not None:
                 self._plane_cache.move_to_end(key)
                 self._apply_rgb(rgb)
+            elif async_render and self._in_flight(key):
+                self._awaited_key = key  # prefetched already: show it when it lands
             elif async_render:
-                from . import render_pool
-
                 # Previous image stays on screen until the worker's result
                 # lands; stale results are dropped via the request id.
-                render_pool.submit(
-                    self,
-                    self.stack,
-                    (t, z, list(self._display_channels()), stride, self._mip_on(),
-                     self.proj_method),
-                    key,
-                    self._render_request,
-                )
+                self._submit_render(t, z, stride, key, self._render_request)
             else:
                 self._apply_rgb(self._cached_render(t, z, stride))
         self._update_header()
         self._sync_channel_boxes()
+        if self._probe_pos is not None and not self.selection.drawing():
+            self._on_mouse_moved(self._probe_pos)  # the plane changed under a still cursor
         self.position_changed.emit(t, z, c)
         if not self._prefetch_scheduled and not self._blank:
             self._prefetch_scheduled = True
-            QTimer.singleShot(60, self._prefetch_neighbors)
+            # Playback wants the next frame now; scrubbing waits for idle.
+            QTimer.singleShot(0 if self._playing_axis() else 60, self._prefetch_neighbors)
+
+    def _playing_axis(self) -> str | None:
+        """"t" or "z" while that axis plays for this pane — on its own bar,
+        or on the shared bar it follows."""
+        bars = self.bars
+        if self.shared_controller is not None and not self.shared_locked:
+            bars = self.shared_controller.shared_bars
+        for letter in ("t", "z"):
+            bar = bars.get(letter)
+            if bar is not None and bar.play_button is not None and bar.play_button.isChecked():
+                return letter
+        return None
 
     def _prefetch_neighbors(self):
-        """Pre-render adjacent z/t planes at idle so scrubbing feels instant."""
+        """Pre-render adjacent z/t planes in the render pool so scrubbing
+        feels instant — only the next frame while an axis plays, so a grid
+        in playback keeps the UI thread free and the cache full of frames
+        it will actually show."""
         self._prefetch_scheduled = False
         if self._blank or not self.isVisible():
             return
         t, z, c_ = self.position()
+        s = self.stack
+        playing = self._playing_axis()
+        if playing == "t":
+            neighbors = [((t + 1) % s.n_frames, z)]
+        elif playing == "z":
+            neighbors = [(t, (z + 1) % s.n_slices)]
+        else:
+            neighbors = [(t, z + 1), (t, z - 1), (t + 1, z), (t - 1, z)]
         stride = self._render_stride()
-        for dt, dz in ((0, 1), (0, -1), (1, 0), (-1, 0)):
-            t2, z2 = t + dt, z + dz
-            if 0 <= t2 < self.stack.n_frames and 0 <= z2 < self.stack.n_slices:
-                self._cached_render(t2, z2, stride)
+        for t2, z2 in neighbors:
+            if 0 <= t2 < s.n_frames and 0 <= z2 < s.n_slices:
+                key = self._render_key(t2, z2, stride)
+                if key not in self._plane_cache and not self._in_flight(key):
+                    self._submit_render(t2, z2, stride, key, -1)  # cache only
 
     def _update_header(self):
         s = self.stack
@@ -991,7 +1067,8 @@ class StackPane(QWidget):
         t, z, c = self.position()
         h, w = s.shape_yx
         parts = []
-        label = s.label(t, z, c)
+        # A slice label would name one hidden slice of a projection.
+        label = None if self._mip_on() else s.label(t, z, c)
         if label:
             parts.append(label)
         pos = []
@@ -1019,7 +1096,15 @@ class StackPane(QWidget):
         self.probe_label.setText(text)
         self.probed.emit(self, text)
 
+    def eventFilter(self, obj, ev):
+        if ev.type() == QEvent.Leave and obj is self.view.viewport():
+            self._probe_pos = None  # cursor gone: nothing to re-read on plane changes
+        return super().eventFilter(obj, ev)
+
     def _on_mouse_moved(self, scene_pos):
+        # Kept so refresh() can re-read the value when the plane changes
+        # under a cursor that doesn't move.
+        self._probe_pos = scene_pos
         if self._blank:
             self.set_probe("")
             return
@@ -1042,8 +1127,10 @@ class StackPane(QWidget):
             self.set_probe("")
 
     def mean_intensity(self) -> float:
-        """Mean of the visible channels at the current position (subsampled);
-        the metric behind the workspace's brightness sort."""
+        """Mean of the visible channels at the current position (subsampled),
+        over the projected plane while the z projection is on — what the
+        tile shows; the metric behind the workspace's brightness sort."""
+        self._sync_shared()  # hidden (soloed-away / filtered) tiles skip it while scrubbing
         if self._blank:
             return float("-inf")
         t, z, c = self.position()
@@ -1051,7 +1138,17 @@ class StackPane(QWidget):
         if not channels:
             return float("-inf")
         data = self.stack.data
-        return float(np.mean([np.mean(data[t, z, ci, ::8, ::8]) for ci in channels]))
+        if self._mip_on():
+            # Sum is displayed like the mean (render scales its window), so
+            # it is ranked like the mean too rather than by slice count.
+            method = "Mean" if self.proj_method == "Sum" else self.proj_method
+            planes = [
+                stack_io.project_block(np.asarray(data[t, :, ci, ::8, ::8]), method)
+                for ci in channels
+            ]
+        else:
+            planes = [data[t, z, ci, ::8, ::8] for ci in channels]
+        return float(np.mean([np.mean(plane) for plane in planes]))
 
     # ---- measurements --------------------------------------------------
 
@@ -1108,6 +1205,12 @@ class StackPane(QWidget):
 
     # ---- actions (invoked from menus of whichever window hosts us) -----
 
+    def _sync_stack_composite(self):
+        """Carry the Composite checkbox into the stack, which is what Save As
+        writes as the ImageJ mode and what a projection inherits."""
+        if self.composite_box is not None:
+            self.stack.composite = self._composite_on()
+
     def save_as(self):
         start_dir = self.stack.path.parent if self.stack.path else Path.home()
         default = str(start_dir / self.stack.name)
@@ -1118,6 +1221,12 @@ class StackPane(QWidget):
             return
         if not path.lower().endswith((".tif", ".tiff")):
             path += ".tif"
+        self._sync_stack_composite()
+        from . import preload, render_pool
+
+        # Nothing may still be reading the file being overwritten.
+        preload.wait_for_loads()
+        render_pool.wait_idle()
         try:
             self.stack.save(path)
         except Exception as exc:  # noqa: BLE001
@@ -1139,7 +1248,9 @@ class StackPane(QWidget):
         axis, method, start, stop = dialog.values()
         from .workspace import show_stack
 
-        show_stack(stack_io.project(self.stack, axis, method, start, stop))
+        self._sync_stack_composite()
+        pane = show_stack(stack_io.project(self.stack, axis, method, start, stop))
+        pane.set_channel_state(*self.channel_state())  # same channels as the source shows
 
     def zoom(self, factor: float):
         self.viewbox.scaleBy((factor, factor))
@@ -1157,83 +1268,144 @@ class StackPane(QWidget):
 
     # ---- export --------------------------------------------------------
 
-    def _full_res_rgb(self, t: int | None = None, z: int | None = None) -> np.ndarray:
+    def _full_res_rgb(
+        self, t: int | None = None, z: int | None = None, channels: list[int] | None = None
+    ) -> np.ndarray:
         t0, z0, c_ = self.position()
         return self.stack.render(
             t if t is not None else t0,
             z if z is not None else z0,
-            self._display_channels(),
+            channels if channels is not None else self._display_channels(),
             stride=1,
             mip=self._mip_on(),
             method=self.proj_method,
         )
+
+    def _displayed_position(self) -> tuple[int, int, int]:
+        """(t, z, c) the tile shows: the shared position while it follows the
+        grid's shared axes — even past this stack's end, where the tile is
+        blank and its own bars still hold the last position it had an image
+        at — else its own."""
+        if (
+            self.shared_controller is not None
+            and self._shared_pos is not None
+            and not self.shared_locked
+        ):
+            return tuple(self._shared_pos)
+        return self.position()
+
+    def _refuse_blank(self) -> bool:
+        """Exports never pass off a stale frame as the view: a tile that is
+        blank on screen says so instead."""
+        if self._blank:
+            _show_status(f"{self.stack.name}: no image at this position", 4000, self)
+        return self._blank
 
     def _rgb_to_qimage(self, rgb: np.ndarray) -> QImage:
         h, w, _ = rgb.shape
         rgb = np.ascontiguousarray(rgb)
         return QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888).copy()
 
-    def _export_name(self, suffix: str) -> str:
-        t, z, c_ = self.position()
+    def _export_name(self, suffix: str, t_span: str = "", z_span: str = "") -> str:
+        """Default export file name: stack, t and z (or the projection);
+        a movie passes the span it animates ("3-6") for that axis."""
+        t, z, c_ = self._displayed_position()
         base = Path(self.stack.name).stem
-        pos = f"_t{t + 1}" + (
-            f"_{self._proj_abbrev()}" if self._mip_on() else f"_z{z + 1}"
+        pos = f"_t{t_span or t + 1}" + (
+            f"_{self._proj_abbrev()}" if self._mip_on() else f"_z{z_span or z + 1}"
         )
         return f"{base}{pos}.{suffix}"
 
     def copy_view(self):
+        if self._refuse_blank():
+            return
         QApplication.clipboard().setImage(self._rgb_to_qimage(self._full_res_rgb()))
-        host = self.window()
-        if isinstance(host, QMainWindow):
-            host.statusBar().showMessage("View copied to clipboard", 3000)
+        _show_status("View copied to clipboard", 3000, self)
 
     def export_png(self):
+        if self._refuse_blank():
+            return
         start = Path(app_settings.last_dir() or Path.home()) / self._export_name("png")
         path, _ = QFileDialog.getSaveFileName(self, "Export view as PNG", str(start), "PNG (*.png)")
         if not path:
             return
         app_settings.set_last_dir(str(Path(path).parent))
-        self._rgb_to_qimage(self._full_res_rgb()).save(path)
+        if not self._rgb_to_qimage(self._full_res_rgb()).save(path):
+            _export_failed(self, path)
+            return
+        _show_status(f"Exported view to {path}", 5000, self)
 
     def export_movie(self):
+        s = self.stack
+        if s.n_frames <= 1 and (s.n_slices <= 1 or self._mip_on()):
+            _show_status("Nothing to animate: single t/z position", 4000, self)
+            return
         dialog = ExportMovieDialog(self)
         if dialog.exec() != QDialog.Accepted:
             return
-        axis, fps = dialog.values()
-        start = Path(app_settings.last_dir() or Path.home()) / self._export_name("gif")
+        axis, fps, (first, last) = dialog.values()
+        # The axis held still comes from what the tile shows — on a blank
+        # tile, the shared position rather than its stale bars.
+        t, z, c = self._displayed_position()
+        held_ok = (z < s.n_slices or self._mip_on()) if axis == "T" else t < s.n_frames
+        if not held_ok or (not self._composite_on() and c >= s.n_channels):
+            _show_status(f"{s.name}: no image at this position", 4000, self)
+            return
+        channels = self._display_channels() if self._composite_on() else [c]
+        span = f"{first + 1}-{last + 1}"
+        name = self._export_name(
+            "gif", t_span=span if axis == "T" else "", z_span=span if axis == "Z" else ""
+        )
+        start = Path(app_settings.last_dir() or Path.home()) / name
         path, _ = QFileDialog.getSaveFileName(self, "Export movie (GIF)", str(start), "GIF (*.gif)")
         if not path:
             return
         app_settings.set_last_dir(str(Path(path).parent))
         from PIL import Image
 
-        t, z, c_ = self.position()
-        count = self.stack.n_frames if axis == "T" else self.stack.n_slices
-        frames = []
-        for i in range(count):
-            rgb = self._full_res_rgb(t=i if axis == "T" else t, z=z if axis == "T" else i)
-            frames.append(Image.fromarray(rgb))
-        frames[0].save(
-            path,
-            save_all=True,
-            append_images=frames[1:],
-            duration=max(int(1000 / fps), 20),
-            loop=0,
+        count = last - first + 1
+        progress = QProgressDialog(
+            f"Rendering {count} movie frames…", "Cancel", 0, count, self.window()
         )
-        host = self.window()
-        if isinstance(host, QMainWindow):
-            host.statusBar().showMessage(f"Exported {count} frames to {path}", 5000)
+        progress.setWindowModality(Qt.WindowModal)
+        frames = []
+        for n, i in enumerate(range(first, last + 1)):
+            progress.setValue(n)
+            QApplication.processEvents()
+            if progress.wasCanceled():
+                return
+            rgb = self._full_res_rgb(
+                t=i if axis == "T" else t, z=z if axis == "T" else i, channels=channels
+            )
+            # Quantize as we go, like the grid GIF: full-RGB frames of a long
+            # timelapse would not fit in RAM.
+            frames.append(Image.fromarray(rgb).convert("P", palette=Image.ADAPTIVE))
+        progress.setValue(count)
+        try:
+            frames[0].save(
+                path,
+                save_all=True,
+                append_images=frames[1:],
+                duration=max(int(1000 / fps), 20),
+                loop=0,
+            )
+        except (OSError, ValueError) as exc:  # ValueError: an unknown extension
+            _export_failed(self, path, exc)
+            return
+        _show_status(f"Exported {count} frames to {path}", 5000, self)
 
     # ---- stack montage (t across, z down) ------------------------------
 
     def _stack_montage_image(
         self, t_idx, z_idx, channels, stride, labels, mip=False, on_tile=None, grid=None,
-        method="Max",
+        method="Max", title=False,
     ):
         """One montage sheet of this stack: t across columns, z down rows;
         a single varying axis wraps into a near-square grid instead, or into
         the (cols, rows) ``grid`` when given (row-major; surplus cells stay
-        black). Returns a PIL image, or None if on_tile() reported a cancel."""
+        black). ``title`` heads the sheet with the stack name, channels and
+        whatever position the tiles share (the z projection, when collapsed).
+        Returns a PIL image, or None if on_tile() reported a cancel."""
         from PIL import Image, ImageDraw, ImageFont
 
         s = self.stack
@@ -1262,23 +1434,39 @@ class StackPane(QWidget):
         cell_h, cell_w = first.shape[:2]
         # t/z headers frame the sheet when both axes vary; a wrapped single
         # axis labels each tile's corner instead.
-        header_h = max(16, cell_h // 16) if (labels and both) else 0
+        line_h = max(16, cell_h // 16)
+        header_h = line_h if (labels and both) else 0
         gutter_w = int(header_h * 2.4)
-        canvas = Image.new(
-            "RGB", (gutter_w + cols * cell_w, header_h + rows * cell_h), (0, 0, 0)
-        )
-        draw = ImageDraw.Draw(canvas)
-        text_size = max(11, int(max(16, cell_h // 16) * 0.7))
+        sheet_w = gutter_w + cols * cell_w
+        text_size = max(11, int(line_h * 0.7))
         try:
             font = ImageFont.load_default(size=text_size)
         except TypeError:  # Pillow < 10 has no sized default font
             font = ImageFont.load_default()
+        title_lines = []
+        if title:
+            info = position_caption(
+                s,
+                channels,
+                t=None if len(t_idx) > 1 else t_idx[0],
+                z=None if len(z_idx) > 1 or mip else z_idx[0],
+                proj=stack_io.PROJECTION_ABBREV[method] if mip else None,
+            )
+            title_lines = caption_lines(s.name, info)
+            if title_lines and font.getlength(title_lines[0]) > sheet_w - 10:
+                title_lines = caption_lines(s.name, info, split=True)
+        top = line_h * len(title_lines) + header_h
+        canvas = Image.new("RGB", (sheet_w, top + rows * cell_h), (0, 0, 0))
+        draw = ImageDraw.Draw(canvas)
         gray = (215, 215, 215)
+        for k, line in enumerate(title_lines):
+            draw.text((5, 2 + k * line_h), line, fill=gray, font=font)
         if labels and both:
+            y = top - header_h
             for c in range(cols):
-                draw.text((gutter_w + c * cell_w + 5, 2), f"t {t_idx[c] + 1}", fill=gray, font=font)
+                draw.text((gutter_w + c * cell_w + 5, y + 2), f"t {t_idx[c] + 1}", fill=gray, font=font)
             for r in range(rows):
-                draw.text((4, header_h + r * cell_h + 3), f"z {z_idx[r] + 1}", fill=gray, font=font)
+                draw.text((4, top + r * cell_h + 3), f"z {z_idx[r] + 1}", fill=gray, font=font)
         rendered = first
         for t, z, r, c, corner in cells:
             rgb = (
@@ -1287,7 +1475,7 @@ class StackPane(QWidget):
                 else s.render(t, z, channels, stride, mip, method)
             )
             rendered = None
-            x, y = gutter_w + c * cell_w, header_h + r * cell_h
+            x, y = gutter_w + c * cell_w, top + r * cell_h
             canvas.paste(Image.fromarray(rgb), (x, y))
             if labels and corner:
                 draw.text((x + 5, y + 3), corner, fill=gray, font=font,
@@ -1300,17 +1488,29 @@ class StackPane(QWidget):
         """Image > Export Stack Montage (Cmd+Alt+M)."""
         s = self.stack
         if s.n_frames <= 1 and s.n_slices <= 1:
-            _show_status("Nothing to montage: single t/z position")
+            _show_status("Nothing to montage: single t/z position", 4000, self)
             return
         dialog = StackMontageDialog(self)
         if dialog.exec() != QDialog.Accepted:
             return
-        t_step, z_step, mip, stride, per_channel, labels, grid = dialog.values()
+        (t_step, z_step, mip, stride, per_channel, labels, grid, title,
+         t_range, z_range) = dialog.values()
         t0, z0, _c0 = self.position()
-        t_idx = list(range(0, s.n_frames, t_step)) if s.n_frames > 1 else [t0]
-        z_idx = list(range(0, s.n_slices, z_step)) if s.n_slices > 1 and not mip else [z0]
-        base = Path(s.name).stem
-        start = Path(app_settings.last_dir() or Path.home()) / f"{base}_montage.png"
+        t_idx = list(range(t_range[0], t_range[1] + 1, t_step)) if s.n_frames > 1 else [t0]
+        z_idx = (
+            list(range(z_range[0], z_range[1] + 1, z_step))
+            if s.n_slices > 1 and not mip
+            else [z0]
+        )
+        # The name carries a narrowed range, and the projection when z collapses.
+        name = Path(s.name).stem + "_montage"
+        if dialog.t_range.narrowed():
+            name += f"_t{dialog.t_range.span()}"
+        if mip:
+            name += f"_{stack_io.PROJECTION_ABBREV[self.proj_method]}"
+        elif dialog.z_range.narrowed():
+            name += f"_z{dialog.z_range.span()}"
+        start = Path(app_settings.last_dir() or Path.home()) / f"{name}.png"
         path, _ = QFileDialog.getSaveFileName(
             self, "Export stack montage", str(start), "PNG (*.png)"
         )
@@ -1337,19 +1537,26 @@ class StackPane(QWidget):
         written = []
         for i, channels in enumerate(channel_sets):
             img = self._stack_montage_image(
-                t_idx, z_idx, channels, stride, labels, mip, tick, grid, self.proj_method
+                t_idx, z_idx, channels, stride, labels, mip, tick, grid, self.proj_method,
+                title,
             )
             if img is None:  # canceled
                 return
             out = Path(path)
             if per_channel:
                 out = out.with_name(f"{out.stem}_C{i + 1}{out.suffix}")
-            img.save(out)
+            try:
+                img.save(out)
+            except (OSError, ValueError) as exc:  # ValueError: an unknown extension
+                progress.cancel()
+                _export_failed(self, out, exc)
+                return
             written.append(out.name)
         progress.setValue(total)
         _show_status(
             "Exported " + (", ".join(written) if per_channel else f"stack montage to {path}"),
             6000,
+            self,
         )
 
 
@@ -1361,6 +1568,83 @@ def _montage_grid(n: int, grid=None) -> tuple[int, int]:
         return cols, math.ceil(n / cols)
     cols = max(1, int(grid[0]))
     return cols, max(1, int(grid[1]), math.ceil(n / cols))
+
+
+def position_caption(stack, channels, t=None, z=None, proj=None) -> str:
+    """Where an exported plane came from, e.g. "c 1+2  z 5  t 12": only the
+    axes the stack has, the z projection (z MIP / z AVG / …) in place of the
+    slice when proj is given, and an axis passed as None left out — a stack
+    montage labels the axis it varies along per tile instead."""
+    parts = []
+    if stack.n_channels > 1:
+        parts.append("c " + ("+".join(str(c + 1) for c in channels) or "none"))
+    if stack.n_slices > 1 and (proj or z is not None):
+        parts.append(f"z {proj}" if proj else f"z {z + 1}")
+    if stack.n_frames > 1 and t is not None:
+        parts.append(f"t {t + 1}")
+    return "  ".join(parts)
+
+
+def caption_lines(name: str, info: str, split: bool = False) -> list[str]:
+    """A montage label: name and position on one line, or on two when split
+    (the caller splits when one line would not fit its cell)."""
+    parts = [part for part in (name, info) if part]
+    if split:
+        return parts
+    return ["  ·  ".join(parts)] if parts else []
+
+
+class AxisRange(QWidget):
+    """An export range along one axis: "[from] to [to] of n", 1-based and
+    inclusive in the boxes. settings.save_widgets remembers it only when
+    narrowed, so a full range stays full on a longer stack."""
+
+    changed = Signal()
+
+    def __init__(self, count: int):
+        super().__init__()
+        self.count = count
+        self.start_spin = QSpinBox()
+        self.stop_spin = QSpinBox()
+        for spin in (self.start_spin, self.stop_spin):
+            spin.setRange(1, count)
+            spin.valueChanged.connect(lambda _v: self.changed.emit())
+        self.stop_spin.setValue(count)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.start_spin)
+        layout.addWidget(QLabel("to"))
+        layout.addWidget(self.stop_spin)
+        layout.addWidget(QLabel(f"of {count}"))
+        layout.addStretch()
+
+    def values(self) -> tuple[int, int]:
+        """(first, last), 0-based and inclusive, in whichever order the boxes hold them."""
+        first, last = sorted((self.start_spin.value(), self.stop_spin.value()))
+        return first - 1, last - 1
+
+    def indices(self, step: int = 1) -> list[int]:
+        first, last = self.values()
+        return list(range(first, last + 1, step))
+
+    def narrowed(self) -> bool:
+        return self.values() != (0, self.count - 1)
+
+    def span(self) -> str:
+        """The range for file names: "3-6"."""
+        first, last = self.values()
+        return f"{first + 1}-{last + 1}"
+
+    def remembered_text(self) -> str:
+        return self.span() if self.narrowed() else "full"
+
+    def restore_text(self, text: str):
+        try:  # "start-stop"; the boxes clamp a range saved on a longer stack
+            start, stop = (int(v) for v in text.split("-", 1))
+        except ValueError:  # "full" (or unreadable): the whole axis
+            start, stop = 1, self.count
+        self.start_spin.setValue(start)
+        self.stop_spin.setValue(stop)
 
 
 class StackMontageDialog(QDialog):
@@ -1379,23 +1663,30 @@ class StackMontageDialog(QDialog):
         self.setWindowTitle("Export Stack Montage")
         s = pane.stack
         form = QFormLayout(self)
+        self.t_range = AxisRange(s.n_frames)
         self.t_spin = QSpinBox()
         self.t_spin.setRange(1, max(s.n_frames - 1, 1))
         if s.n_frames > 1:
+            form.addRow("t range:", self.t_range)
             form.addRow("Every nth t:", self.t_spin)
         self.z_combo = QComboBox()
         self.z_combo.addItem("All slices as rows", False)
-        self.z_combo.addItem(
-            f"{PROJ_MENU_TEXT[pane.proj_method]} projection "
-            f"({stack_io.PROJECTION_ABBREV[pane.proj_method]})",
-            True,
-        )
-        if pane._mip_on():
+        # Collapsing z leaves a single tile unless t varies, so a t-less
+        # stack is only offered its slices.
+        if s.n_frames > 1:
+            self.z_combo.addItem(
+                f"{PROJ_MENU_TEXT[pane.proj_method]} projection "
+                f"({stack_io.PROJECTION_ABBREV[pane.proj_method]})",
+                True,
+            )
+        if pane._mip_on() and self.z_combo.count() > 1:
             self.z_combo.setCurrentIndex(1)
+        self.z_range = AxisRange(s.n_slices)
         self.z_spin = QSpinBox()
         self.z_spin.setRange(1, max(s.n_slices - 1, 1))
         if s.n_slices > 1:
             form.addRow("z:", self.z_combo)
+            form.addRow("z range:", self.z_range)
             form.addRow("Every nth z:", self.z_spin)
         # Layout applies when a single axis varies (t, z, or t with z
         # collapsed to a projection); with both varying the sheet is always t
@@ -1430,11 +1721,19 @@ class StackMontageDialog(QDialog):
         self.labels_box = QCheckBox("t/z position labels")
         self.labels_box.setChecked(True)
         form.addRow("", self.labels_box)
+        self.title_box = QCheckBox("Stack name, channel and projection above the sheet")
+        self.title_box.setToolTip(
+            "Heads the sheet with where it came from, e.g. XY05.tif  ·  c 1+2  z MIP"
+        )
+        self.title_box.setChecked(True)
+        form.addRow("", self.title_box)
         self.estimate = QLabel()
         self.estimate.setStyleSheet("color: #909090;")
         form.addRow("", self.estimate)
         for signal in (
+            self.t_range.changed,
             self.t_spin.valueChanged,
+            self.z_range.changed,
             self.z_spin.valueChanged,
             self.z_combo.currentIndexChanged,
             self.layout_combo.currentIndexChanged,
@@ -1456,7 +1755,7 @@ class StackMontageDialog(QDialog):
         # projection on still preselects the collapsed export, in the pane's
         # own method, since that's what's on screen.
         app_settings.restore_widgets("stackMontage", self._remembered())
-        if pane._mip_on():
+        if pane._mip_on() and self.z_combo.count() > 1:
             self.z_combo.setCurrentIndex(1)
 
     def _remembered(self) -> dict[str, QWidget]:
@@ -1467,9 +1766,11 @@ class StackMontageDialog(QDialog):
         s = self.pane.stack
         widgets: dict[str, QWidget] = {}
         if s.n_frames > 1:
+            widgets["tRange"] = self.t_range
             widgets["tStep"] = self.t_spin
         if s.n_slices > 1:
             widgets["z"] = self.z_combo
+            widgets["zRange"] = self.z_range
             widgets["zStep"] = self.z_spin
         widgets["layout"] = self.layout_combo
         widgets["cols"] = self.cols_spin
@@ -1478,6 +1779,7 @@ class StackMontageDialog(QDialog):
         if self.channels_combo is not None:
             widgets["channels"] = self.channels_combo
         widgets["labels"] = self.labels_box
+        widgets["title"] = self.title_box
         return widgets
 
     def accept(self):
@@ -1491,8 +1793,8 @@ class StackMontageDialog(QDialog):
         """(nt, nz): tiles along each axis for the current options."""
         s = self.pane.stack
         mip = self.z_combo.currentData()
-        nt = len(range(0, s.n_frames, self.t_spin.value())) if s.n_frames > 1 else 1
-        nz = len(range(0, s.n_slices, self.z_spin.value())) if s.n_slices > 1 and not mip else 1
+        nt = len(self.t_range.indices(self.t_spin.value())) if s.n_frames > 1 else 1
+        nz = len(self.z_range.indices(self.z_spin.value())) if s.n_slices > 1 and not mip else 1
         return nt, nz
 
     def _grid_edited(self, edited: QSpinBox, other: QSpinBox):
@@ -1530,6 +1832,7 @@ class StackMontageDialog(QDialog):
         s = self.pane.stack
         mip = self.z_combo.currentData()
         self.z_spin.setEnabled(not mip)
+        self.z_range.setEnabled(not mip)  # a projection covers every slice, as on screen
         cols, rows, both = self._grid()
         n = max(self._counts())
         self.layout_combo.setEnabled(not both)
@@ -1550,7 +1853,14 @@ class StackMontageDialog(QDialog):
             text += f" · {empty} empty"
         self.estimate.setText(text)
 
-    def values(self) -> tuple[int, int, bool, int, bool, bool, tuple[int, int] | None]:
+    def values(
+        self,
+    ) -> tuple[
+        int, int, bool, int, bool, bool, tuple[int, int] | None, bool,
+        tuple[int, int], tuple[int, int],
+    ]:
+        """(t step, z step, collapse z, stride, one file per channel, t/z
+        labels, grid, title, t range, z range) — ranges 0-based, inclusive."""
         per_channel = (
             self.channels_combo.currentData() if self.channels_combo is not None else False
         )
@@ -1564,6 +1874,9 @@ class StackMontageDialog(QDialog):
             bool(per_channel),
             self.labels_box.isChecked(),
             grid,
+            self.title_box.isChecked(),
+            self.t_range.values(),
+            self.z_range.values(),
         )
 
 
@@ -1581,20 +1894,38 @@ class ExportMovieDialog(QDialog):
         self.fps_spin.setRange(1, 60)
         self.fps_spin.setValue(10)
         form.addRow("Axis:", self.axis_combo)
+        # One range per axis on offer; only the animated one applies.
+        self.ranges: dict[str, AxisRange] = {}
+        for letter, count in (("T", pane.stack.n_frames), ("Z", pane.stack.n_slices)):
+            if self.axis_combo.findText(letter) >= 0:
+                self.ranges[letter] = AxisRange(count)
+                form.addRow(f"{letter.lower()} range:", self.ranges[letter])
         form.addRow("Frames/second:", self.fps_spin)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         form.addRow(buttons)
+        self.axis_combo.currentTextChanged.connect(self._on_axis)
         self._remembered = {"axis": self.axis_combo, "fps": self.fps_spin}
+        for letter, rng in self.ranges.items():
+            self._remembered[f"{letter.lower()}Range"] = rng
         app_settings.restore_widgets("movie", self._remembered)
+        self._on_axis()
+
+    def _on_axis(self, *_):
+        for letter, rng in self.ranges.items():
+            rng.setEnabled(letter == self.axis_combo.currentText())
 
     def accept(self):
         app_settings.save_widgets("movie", self._remembered)
         super().accept()
 
-    def values(self) -> tuple[str, int]:
-        return self.axis_combo.currentText(), self.fps_spin.value()
+    def values(self) -> tuple[str, int, tuple[int, int] | None]:
+        """(axis, fps, (first, last) frames of that axis, 0-based) — axis
+        is "" and the range None when the stack has nothing to animate."""
+        axis = self.axis_combo.currentText()
+        rng = self.ranges.get(axis)
+        return axis, self.fps_spin.value(), rng.values() if rng else None
 
 
 def build_menus(window: QMainWindow, active_pane: Callable[[], StackPane | None]):
@@ -1730,6 +2061,15 @@ def build_menus(window: QMainWindow, active_pane: Callable[[], StackPane | None]
             action.setChecked(action.data() == name)
 
     roi.tool_changed().connect(sync_tool_actions)
+
+    # The tool signal is app-wide: let go of this menu when its window goes.
+    def release_tool_signal(*_):
+        try:
+            roi.tool_changed().disconnect(sync_tool_actions)
+        except RuntimeError:  # app teardown: the signal's owner went first
+            pass
+
+    window.destroyed.connect(release_tool_signal)
     _add(analyze_menu, "Select &All", QKeySequence.SelectAll, _with_pane(lambda p: p.selection.select_all()))
     _add(analyze_menu, "Select &None", "Ctrl+Shift+A", _with_pane(lambda p: p.selection.clear()))
 
@@ -1793,6 +2133,10 @@ class StackWindow(QMainWindow):
 
     def __init__(self, pane: StackPane):
         super().__init__()
+        # Closing frees the window and its pane (so the stack's memory goes
+        # and B&C panels see the pane's destroyed signal); combining takes
+        # the pane out first, so it survives.
+        self.setAttribute(Qt.WA_DeleteOnClose)
         self.pane = pane
         pane.set_tiled(False)
         self.setCentralWidget(pane)
@@ -1912,7 +2256,7 @@ class FileDropMixin:
         if not mime.hasUrls():
             return []
         paths = [url.toLocalFile() for url in mime.urls()]
-        return [p for p in paths if p.lower().endswith((".tif", ".tiff"))]
+        return [p for p in paths if _is_tiff_name(Path(p).name)]
 
     def dragEnterEvent(self, ev):
         if self._dropped_tiff_paths(ev.mimeData()):
@@ -1947,11 +2291,24 @@ class _StackLoader(QThread):
 _loaders: set[_StackLoader] = set()
 
 
-def _show_status(message: str, msecs: int = 4000):
+def _show_status(message: str, msecs: int = 4000, near: QWidget | None = None):
+    """A status-bar message in near's window — the stack window or grid the
+    user is working in — or the control window's without one."""
+    host = near.window() if near is not None else None
+    if isinstance(host, QMainWindow):
+        host.statusBar().showMessage(message, msecs)
+        return
     from . import control_panel
 
     if control_panel._instance is not None:
         control_panel._instance.statusBar().showMessage(message, msecs)
+
+
+def _export_failed(parent: QWidget | None, path, error=None):
+    """Tell the user an export was not written (a full disk, a read-only
+    folder…) instead of failing silently."""
+    detail = f"\n\n{error}" if error else ""
+    QMessageBox.critical(parent, "Export failed", f"Could not write {path}{detail}")
 
 
 def _on_async_render_done(pane: StackPane, key: tuple, rgb, request_id: int):
@@ -2053,6 +2410,21 @@ def open_stack_dialog(parent: QWidget | None = None):
     open_paths(paths, parent)
 
 
+def _is_tiff_name(name: str) -> bool:
+    """A .tif/.tiff that isn't hidden — which also skips the ._XY01.tif
+    AppleDouble sidecars macOS writes on exFAT and network drives."""
+    return name.lower().endswith((".tif", ".tiff")) and not name.startswith(".")
+
+
+def list_tiffs(folder: str | Path) -> list[Path]:
+    """The folder's TIFF stacks in natural order (XY2 before XY10), like
+    the grid's Name sort."""
+    from .workspace import _natural_key
+
+    files = [p for p in Path(folder).iterdir() if p.is_file() and _is_tiff_name(p.name)]
+    return sorted(files, key=lambda p: _natural_key(p.name))
+
+
 def open_folder(parent: QWidget | None = None, directory: str | Path | None = None):
     """Open every TIFF stack in a folder at once."""
     if directory is None:
@@ -2062,10 +2434,7 @@ def open_folder(parent: QWidget | None = None, directory: str | Path | None = No
         if not directory:
             return
     app_settings.set_last_dir(str(directory))
-    open_paths(
-        [p for p in sorted(Path(directory).iterdir()) if p.suffix.lower() in (".tif", ".tiff")],
-        parent,
-    )
+    open_paths(list_tiffs(directory), parent)
 
 
 _CHEATSHEET = """

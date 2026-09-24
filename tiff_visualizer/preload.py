@@ -82,6 +82,14 @@ def maybe_preload(stack):
     loader.start()
 
 
+def wait_for_loads():
+    """Block until in-flight preloads finish. Call before overwriting a file:
+    a copy still reading a memory-mapped file that gets truncated under it
+    would crash (SIGBUS) or bring back garbage."""
+    for loader in list(_threads):
+        loader.wait()
+
+
 def preload_existing():
     """Apply current settings to already-open stacks (after enabling/raising)."""
     from .viewer import _all_panes

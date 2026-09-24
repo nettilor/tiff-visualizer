@@ -6,6 +6,7 @@ active stack (last clicked). Closing it quits the app.
 
 from __future__ import annotations
 
+import functools
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -31,6 +32,24 @@ from . import viewer, workspace
 from .viewer import FileDropMixin, StackPane, build_menus
 
 
+def _canonical(path) -> Path | None:
+    """One spelling per file, so a stack opened through a relative or
+    symlinked path (tiffviz XY05.tif, /tmp vs /private/tmp) still matches
+    its folder-list entry."""
+    return _resolved(str(path)) if path else None
+
+
+@functools.lru_cache(maxsize=4096)
+def _resolved(path: str) -> Path:
+    # Cached: the open-state sync runs on every focus change, and resolving
+    # each open stack's path there costs a filesystem lookup (network drives).
+    return Path(path).resolve()
+
+
+def _open_stack_paths() -> set[Path]:
+    return {_canonical(p.stack.path) for p in viewer._all_panes if p.stack.path}
+
+
 def _close_stack_by_path(path: Path):
     """Close every open pane showing this file, wherever it lives."""
     _close_stacks_by_paths({path})
@@ -39,7 +58,10 @@ def _close_stack_by_path(path: Path):
 def _close_stacks_by_paths(paths: set):
     """Same, for many files at once: the grid tiles go in one batch so the
     layout is rebuilt once instead of once per closed stack."""
-    targets = [p for p in list(viewer._all_panes) if p.stack.path in paths]
+    paths = {_canonical(p) for p in paths}
+    targets = [
+        p for p in list(viewer._all_panes) if p.stack.path and _canonical(p.stack.path) in paths
+    ]
     ws = workspace._workspace
     tiled = [p for p in targets if ws is not None and p in ws.panes]
     if tiled:
@@ -84,16 +106,19 @@ class FolderSection(QWidget):
         files_layout = QVBoxLayout(files_widget)
         files_layout.setContentsMargins(8, 0, 0, 0)
         files_layout.setSpacing(2)
+        # Keyed by canonical path to match open stacks; opened and labeled as
+        # listed, so a symlinked position keeps its own name.
         self.checks: dict[Path, QCheckBox] = {}
-        open_paths = {p.stack.path for p in viewer._all_panes}
-        for file in sorted(path.iterdir()):
-            if file.suffix.lower() not in (".tif", ".tiff"):
-                continue
+        self.listed: dict[Path, Path] = {}
+        open_paths = _open_stack_paths()
+        for file in viewer.list_tiffs(path):
+            key = _canonical(file)
             box = QCheckBox(file.name)
-            box.setChecked(file in open_paths)
-            box.toggled.connect(lambda on, f=file: self._on_toggled(f, on))
+            box.setChecked(key in open_paths)
+            box.toggled.connect(lambda on, f=key: self._on_toggled(f, on))
             files_layout.addWidget(box)
-            self.checks[file] = box
+            self.checks[key] = box
+            self.listed[key] = file
         files_layout.addStretch(1)
 
         self.scroll = QScrollArea()
@@ -140,7 +165,7 @@ class FolderSection(QWidget):
             return
         with self.owner.bulk_update():
             if on:
-                viewer.open_paths(files, self)
+                viewer.open_paths([self.listed[f] for f in files], self)
             else:
                 _close_stacks_by_paths(set(files))
         self.owner.statusBar().showMessage(
@@ -149,7 +174,7 @@ class FolderSection(QWidget):
 
     def _on_toggled(self, file: Path, on: bool):
         if on:
-            viewer.open_path(file, self)
+            viewer.open_path(self.listed[file], self)
         else:
             _close_stack_by_path(file)
         self.owner.refresh_state()
@@ -449,7 +474,7 @@ class ControlWindow(FileDropMixin, QMainWindow):
         )
         self.shared_button.setChecked(workspace.shared_axes())
         self.active_label.setText(f"Active: {pane.stack.name}" if pane else "No stack open")
-        open_paths = {p.stack.path for p in viewer._all_panes}
+        open_paths = _open_stack_paths()
         for section in self.folder_sections.values():
             section.sync(open_paths)
 

@@ -9,13 +9,14 @@ thread via a queued signal. The UI thread stays free to process clicks.
 from __future__ import annotations
 
 import os
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 
 from PySide6.QtCore import QObject, Signal
 
 _handler = None
 _bridge: "_Bridge | None" = None
 _pool: ThreadPoolExecutor | None = None
+_pending: set = set()  # futures not yet finished
 
 
 class _Bridge(QObject):
@@ -53,4 +54,14 @@ def submit(pane, stack, render_args: tuple, key, request_id: int):
             return
         bridge.done.emit(pane, key, rgb, request_id)
 
-    _pool.submit(work)
+    future = _pool.submit(work)
+    _pending.add(future)
+    future.add_done_callback(_pending.discard)
+
+
+def wait_idle():
+    """Block until queued renders finish. Call before overwriting a file:
+    a worker still reading its memory map as it is truncated would crash
+    (SIGBUS). Nothing new is queued meanwhile — submits come from the main
+    thread, which is the one waiting."""
+    wait(list(_pending))
