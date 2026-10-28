@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import colorsys
 import json
+import math
 import re
 import sys
 from dataclasses import dataclass
@@ -327,8 +328,10 @@ class PlateView(QWidget):
     on Windows, Alt+click anywhere) takes the one well."""
 
     toggle = Signal(list, bool)  # (file keys, open?)
-    MAX_CELL = 44.0
-    MAX_TEXT_PT = 12.0
+    # The well size the control window grows to fit when a plate appears. The
+    # wells scale on from there with whatever room the window is given — drag
+    # it wider or taller and they, their labels and the gutters grow to fill.
+    PREFERRED_CELL = 44.0
     MIN_TEXT_PT = 7.0  # smaller than this is not readable: the label falls back
 
     def __init__(self, doc: PlateLayout, parent: QWidget | None = None):
@@ -350,7 +353,7 @@ class PlateView(QWidget):
         self._fits = True
         self._laid_out = False
         self.setMouseTracking(True)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setMinimumWidth(180)
         self._regroup()
 
@@ -419,13 +422,15 @@ class PlateView(QWidget):
 
     def _label_fonts(self, cell: float) -> list[tuple]:
         """Candidate label fonts for this cell size, largest first, each
-        with its metrics — built once per paint, not per well."""
-        top = max(min(cell * 0.32, self.MAX_TEXT_PT), self.MIN_TEXT_PT)
+        with its metrics — built once per paint, not per well. The largest
+        is a third of the well, so labels grow with the wells."""
+        top = max(cell * 0.32, self.MIN_TEXT_PT)
+        step = max(1.0, top / 24)  # a point at a time; coarser once the wells are huge
         sizes = []
         pt = top
-        while pt > self.MIN_TEXT_PT + 0.5:
+        while pt > self.MIN_TEXT_PT + step / 2:
             sizes.append(pt)
-            pt -= 1.0
+            pt -= step
         sizes.append(self.MIN_TEXT_PT)
         fonts = []
         for pt in sizes:
@@ -508,20 +513,54 @@ class PlateView(QWidget):
 
     # ---- geometry ------------------------------------------------------
 
-    def _metrics_for(self, width: int) -> tuple[float, float, float]:
-        """(left gutter, top gutter, well pitch) at this width."""
-        fm = QFontMetrics(self.font())
-        left = fm.horizontalAdvance(row_label(self.plate.rows - 1)) + 8
-        top = fm.height() + 4
-        cell = min((width - left - 2) / self.plate.cols, self.MAX_CELL)
-        return left, top, max(cell, 4.0)
+    def _gutter_font(self, cell: float):
+        """Row letters and column numbers at the size the wells dictate: a
+        third of a well, no smaller than 6 pt and no larger than twice the
+        app's text size, so the grid stays the subject at any window size."""
+        base = self.font()
+        base_pt = base.pointSizeF() if base.pointSizeF() > 0 else 12.0
+        font = self.font()
+        font.setPointSizeF(max(min(cell * 0.3, 2 * base_pt), 6.0))
+        return font
+
+    def _layout_for(self, width: float, height: float | None, cap: float | None) -> tuple[float, float, float]:
+        """(left gutter, top gutter, well pitch) for the plate drawn in a box
+        of this size: the wells fill the width, and the height when one is
+        given, up to `cap`. The gutters hold the labels at the size the wells
+        dictate, which depends on the wells' size in turn; a few rounds of
+        the fixed point settle it (the gutter is a small fraction of a well,
+        so it converges at once)."""
+        rows, cols = self.plate.rows, self.plate.cols
+        cell = self.PREFERRED_CELL
+        for _ in range(3):
+            fm = QFontMetrics(self._gutter_font(cell))
+            left = fm.horizontalAdvance(row_label(rows - 1)) + 8
+            top = fm.height() + 4
+            fit = (width - left - 2) / cols
+            if height is not None:
+                fit = min(fit, (height - top - 2) / rows)
+            if cap is not None:
+                fit = min(fit, cap)
+            cell = max(fit, 4.0)
+        return left, top, cell
+
+    def _metrics(self) -> tuple[float, float, float]:
+        """(left gutter, top gutter, well pitch) as drawn: the wells fill the
+        view in whichever direction is tighter, and the grid is centred when
+        the height is what limits it."""
+        left, top, cell = self._layout_for(self.width(), self.height(), None)
+        slack = self.width() - left - 2 - cell * self.plate.cols
+        return left + max(slack, 0.0) / 2, top, cell
 
     def hasHeightForWidth(self) -> bool:
         return True
 
     def heightForWidth(self, width: int) -> int:
-        left, top, cell = self._metrics_for(width)
-        return int(top + cell * self.plate.rows) + 2
+        """The height the plate asks for at this width: wells of the preferred
+        size, or smaller when the width doesn't allow them. The window grows
+        to give it this much and the wells take any more it is given."""
+        left, top, cell = self._layout_for(width, None, self.PREFERRED_CELL)
+        return int(math.ceil(top + cell * self.plate.rows)) + 2
 
     def sizeHint(self) -> QSize:
         return QSize(320, self.heightForWidth(320))
@@ -537,10 +576,11 @@ class PlateView(QWidget):
 
     def fit_height(self, shown: bool = True):
         """Keep the whole plate on screen: the minimum height follows the
-        width, so the window grows rather than clipping rows. Dropped while
-        the file list is showing instead, so that page can be short. Before
-        the layout has placed the view its width is a default, not a size,
-        so the first real resize sets the minimum instead."""
+        width (up to the preferred well size), so the window grows rather
+        than clipping rows; past that the wells grow with the window instead.
+        Dropped while the file list is showing, so that page can be short.
+        Before the layout has placed the view its width is a default, not a
+        size, so the first real resize sets the minimum instead."""
         self._fits = shown
         if not shown:
             self.setMinimumHeight(0)
@@ -548,12 +588,12 @@ class PlateView(QWidget):
             self.setMinimumHeight(self.heightForWidth(self.width()))
 
     def well_rect(self, well: int) -> QRectF:
-        left, top, cell = self._metrics_for(self.width())
+        left, top, cell = self._metrics()
         r, c = divmod(well, self.plate.cols)
         return QRectF(left + c * cell, top + r * cell, cell, cell)
 
     def well_at(self, pos, clamp: bool = False) -> int | None:
-        left, top, cell = self._metrics_for(self.width())
+        left, top, cell = self._metrics()
         c = (pos.x() - left) / cell
         r = (pos.y() - top) / cell
         if clamp:
@@ -578,14 +618,10 @@ class PlateView(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         p.setRenderHint(QPainter.TextAntialiasing)
-        left, top, cell = self._metrics_for(self.width())
+        left, top, cell = self._metrics()
         rows, cols = self.plate.rows, self.plate.cols
-        base = self.font()
-        base_pt = base.pointSizeF() if base.pointSizeF() > 0 else 12.0
 
-        gutter_font = self.font()
-        gutter_font.setPointSizeF(max(min(cell * 0.3, base_pt), 6.0))
-        p.setFont(gutter_font)
+        p.setFont(self._gutter_font(cell))
         p.setPen(QColor("#909090"))
         for c in range(cols):
             p.drawText(QRectF(left + c * cell, 0, cell, top), Qt.AlignCenter, str(c + 1))
@@ -598,9 +634,12 @@ class PlateView(QWidget):
             else None
         )
         # Square wells with a small rounding, like pLayout's: the full cell
-        # is room for text, where a circle wasted its corners.
+        # is room for text, where a circle wasted its corners. Rounding and
+        # the open/hover outlines keep their proportion as the wells grow.
         pad = cell * 0.06
-        radius = min(3.0, (cell - 2 * pad) / 6)
+        radius = max(2.0, min((cell - 2 * pad) * 0.08, (cell - 2 * pad) / 6))
+        thick = max(2.5, cell * 0.045)
+        thin = max(2.0, cell * 0.035)
         fonts = self._label_fonts(cell)
         labels: dict[tuple, tuple] = {}  # every cell is the same size: fit each text once
         text_w = cell - 2 * pad - 3
@@ -615,16 +654,16 @@ class PlateView(QWidget):
             border = QPen(QColor("#3a3a3a"), 1)
             in_hover = well == self._hover or (hover_group is not None and self._groups.get(well) == hover_group)
             if well in self._preview:
-                border = QPen(QColor("#2f6fd0"), 2.5)
+                border = QPen(QColor("#2f6fd0"), thick)
                 if not self._on:
                     border.setStyle(Qt.DashLine)
             elif state == "open":
-                border = QPen(QColor("#ffffff"), 2.5)
+                border = QPen(QColor("#ffffff"), thick)
             elif state == "partial":
-                border = QPen(QColor("#ffffff"), 2.5)
+                border = QPen(QColor("#ffffff"), thick)
                 border.setStyle(Qt.DashLine)
             elif in_hover and state != "none":
-                border = QPen(QColor("#e0e0e0"), 2)
+                border = QPen(QColor("#e0e0e0"), thin)
             p.setPen(border)
             p.setBrush(fill)
             p.drawRoundedRect(rect, radius, radius)
@@ -816,8 +855,8 @@ class PlatePanel(QWidget):
         self.status = QLabel()
         self.status.setStyleSheet("color: #909090;")
         box.addWidget(self.status)
-        box.addWidget(self.view)
-        box.addStretch(1)
+        # The wells take every bit of height the window gives the section.
+        box.addWidget(self.view, 1)
         self._update_group_button()
         self._mode_changed()
 

@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.7.1 — 2026-10-28
+
+### Plate layouts (pLayout)
+- **The plate scales with the control window**: drag the window wider or
+  taller and the wells, their labels and the row/column letters grow to fill
+  the room it gives the plate — the wells used to stop at 44 px and the text
+  at 12 pt. The window still grows on its own only up to that well size when
+  a plate appears, so widening it never forces it taller than before; when
+  the height is what limits the plate it sits centred in the width. Labels
+  stay the largest size that fits each well, down to the 7 pt fallback, and
+  the outlines of open and hovered wells keep their proportion.
+
 ## 1.7.0 — 2026-10-28
 
 ### Plate layouts (pLayout)
