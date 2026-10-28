@@ -1,5 +1,71 @@
 # Changelog
 
+## 1.7.0 — 2026-10-28
+
+### Plate layouts (pLayout)
+- **Plate layouts in the control window**: drop a pLayout `.plate` file onto
+  the control window (or File → Open Plate Layout…) and the folder section
+  becomes the plate. Wells map to the folder's stacks through the XY factor
+  pLayout's XY Position Fill writes (`XY5` and `XY05` agree; several files on
+  one position open together); a layout without an XY factor matches well
+  labels like `B02` in the file name; in a multi-plate layout a file naming
+  its plate (`p2_XY01.tif`) counts for that plate only. A click on a well
+  opens or closes its stack, a press-and-drag takes a rectangle, Cmd+click
+  (Ctrl on Windows, Alt anywhere) one well.
+- **Colour by any factor, or by Replicates**: wells sharing the Group-by
+  factors' values share a colour and open together with one click. Wells are
+  rounded squares, like pLayout's, so the label gets the whole cell: in
+  Replicates mode each well shows the grouping factors' values, one line per
+  factor, as large as fits and down to 7 pt — on one line when two don't
+  fit, and the group number when even that is too small to read, so a
+  narrow control window still says which wells go together.
+- **Group by** lists every factor; the XY position starts unchecked (it
+  would make each well its own group) and so does any factor hidden in
+  pLayout's Overview — pLayout saves that choice with the document, so
+  hiding XY there carries over here.
+- Hovering a well shows its label, every factor's value, pLayout's well note
+  and the matched file(s); open stacks carry their conditions as a tooltip
+  on the header line. ☰ / ⊞ flips between the plate and the plain file list;
+  a **Plate layout…** button under each folder list links a file explicitly
+  and ✕ on the plate's row unlinks it. The plate ↔ folder pairing is
+  remembered both ways until unlinked; `.plate` is registered as a document
+  type, so Finder and `open -a` work. pLayout is untouched: its JSON is read
+  with the standard library.
+
+### Control window
+- **Range selection in folder lists**: press on a file and drag across the
+  others, or Shift+click after a plain click, and the whole range opens or
+  closes as one batch (one grid relayout); the boxes preview the range while
+  the button is down, a drag past the list's edge auto-scrolls it, a click
+  anywhere on a row counts, and the status bar reports "Opened n stacks".
+
+### Grid & windows
+- **Closing the grid window closes the stacks in it**, like closing any stack
+  window. Cmd+G (or the Combine/Split button) is the way to split them back
+  out; the old silent split looked like the stacks had been kept somewhere.
+
+### Performance (measured on macOS with 48 stacks)
+- **Grid changes are incremental**: a tile already in its row at its column
+  is left alone, one that shifts within its row moves without reparenting,
+  only tiles that change rows are reparented, soloing hides the other tiles
+  in place and un-solo just shows them. Every change used to unparent and
+  re-add all 48 tiles: closing one tile 200 → 26 ms, un-solo 190 → 10 ms.
+- **Split, Combine Selected and Close all** detach every tile in one layout
+  pass instead of one per tile: split 4.7 s → 0.4 s, Close all 2.8 s → 50 ms.
+- **Opening 48 stacks as windows** 2.6 s → 0.85 s: stack windows build their
+  menu bar on first activation, a batch of windows activates only the last
+  one, and the grid comes up before the old windows close so macOS doesn't
+  hand key status down 48 times.
+- **No full-resolution render on the main thread any more**: a new pane
+  starts from a 2 ms low-resolution preview and renders for its real
+  on-screen size in the render pool, as do zoom and resize stride changes
+  (the plane on screen stays, scaled, until the new one lands).
+- **Rendering is 3-4× faster** for 8- and 16-bit planes (a 4-channel 960×720
+  composite 31 → 9 ms, identical output): the display window and LUT are
+  folded into one packed colour table per channel. Planes are also handed to
+  the display without a levels rescale pyqtgraph was running on every paint.
+- `tests/bench_layout.py` reproduces these timings.
+
 ## 1.6.0 — 2026-09-24
 
 ### Exports

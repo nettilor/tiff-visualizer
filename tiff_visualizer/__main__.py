@@ -63,9 +63,17 @@ class OpenBatcher:
 def open_batch(paths):
     """Open files handed to the app (argv, Finder, the Dock) as one batch.
     Absolute, so a relative path still says where the file is; the folder
-    lists compare resolved paths, so symlinks match too."""
-    with get_control_window().bulk_update():
-        open_paths([Path(os.path.abspath(p)) for p in paths])
+    lists compare resolved paths, so symlinks match too. A pLayout .plate
+    among them attaches to its folder section once the stacks are open."""
+    from .plate import is_plate_name
+
+    paths = [Path(os.path.abspath(p)) for p in paths]
+    plates = [p for p in paths if is_plate_name(p.name)]
+    control = get_control_window()
+    with control.bulk_update():
+        open_paths([p for p in paths if p not in plates])
+    for plate_path in plates:
+        control.open_plate(plate_path)
 
 
 class TiffApplication(QApplication):

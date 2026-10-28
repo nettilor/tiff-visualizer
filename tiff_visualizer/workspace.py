@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import re
+from contextlib import contextmanager
 from pathlib import Path
 
 from PySide6.QtCore import Qt
@@ -108,13 +109,18 @@ def combine_all():
         if window.pane is not None:
             window.pane.saved_window_geometry = window.saveGeometry()
         pane = window.detach_pane()
-        window.close()
         if pane is not None:
             detached.append(pane)
     ws.add_panes(detached)
     if ws.panes:
+        # Up and active before the windows go: on macOS closing the key
+        # window hands key status (and the menu bar) to the next one, so
+        # 48 closes used to be 48 activations.
         ws.show()
         ws.raise_()
+        ws.activateWindow()
+    for window in windows:
+        window.close()
 
 
 def split_all():
@@ -122,9 +128,7 @@ def split_all():
     ws = _workspace
     if ws is None:
         return
-    for pane in list(ws.panes):
-        ws.take_pane(pane)
-        StackWindow(pane).show()
+    viewer.show_in_windows(ws.take_panes(list(ws.panes)))
     ws.hide()
 
 
@@ -139,9 +143,7 @@ def combine_selected(selected: list[StackPane]):
     """Put exactly `selected` in the grid; everything else gets its own window."""
     ws = get_workspace()
     selected = [p for p in selected if p in viewer._all_panes]
-    for pane in [p for p in ws.panes if p not in selected]:
-        ws.take_pane(pane)
-        StackWindow(pane).show()
+    viewer.show_in_windows(ws.take_panes([p for p in ws.panes if p not in selected]))
     to_add = []
     windows = sorted(
         viewer._open_windows,
@@ -532,11 +534,22 @@ class WorkspaceWindow(FileDropMixin, QMainWindow):
 
     def take_pane(self, pane: StackPane):
         """Detach a pane (still alive) from the grid."""
-        self._detach_pane(pane)
-        self._after_detach()
+        self.take_panes([pane])
 
-    def _detach_pane(self, pane: StackPane):
-        """Unhook one pane; the grid is left stale until _after_detach()."""
+    def take_panes(self, panes: list[StackPane]) -> list[StackPane]:
+        """Detach many panes (still alive) with a single grid rebuild; the
+        ones that were in the grid, in grid order."""
+        panes = [p for p in self.panes if p in panes]
+        with self._hold_restride():
+            for pane in panes:
+                self._detach_pane(pane)
+            self._after_detach()
+        return panes
+
+    def _detach_pane(self, pane: StackPane, closing: bool = False):
+        """Unhook one pane; the grid is left stale until _after_detach().
+        A closing pane is only taken out: its chrome, bars and view links
+        go with it."""
         self.panes.remove(pane)
         for signal, slot in (
             (pane.float_requested, float_pane),
@@ -554,7 +567,10 @@ class WorkspaceWindow(FileDropMixin, QMainWindow):
         if self._probed_pane is pane:
             self._probed_pane = None
             self.probe_label.setText("")
+        pane.hide()  # its row stops laying it out
         pane.setParent(None)
+        if closing:
+            return
         pane.set_tiled(False)
         pane.clear_shared()
         pane.viewbox.setXLink(None)
@@ -585,11 +601,12 @@ class WorkspaceWindow(FileDropMixin, QMainWindow):
 
     def close_panes(self, panes: list[StackPane]):
         """Close many tiles with a single grid rebuild."""
-        for pane in [p for p in panes if p in self.panes]:
-            self._detach_pane(pane)
-            pane.unregister()
-            pane.deleteLater()
-        self._after_detach()
+        with self._hold_restride():
+            for pane in [p for p in panes if p in self.panes]:
+                self._detach_pane(pane, closing=True)
+                pane.unregister()
+                pane.deleteLater()
+            self._after_detach()
         if not self.panes:
             self.hide()
 
@@ -611,38 +628,103 @@ class WorkspaceWindow(FileDropMixin, QMainWindow):
                 return flagged
         return list(self.panes)
 
+    @contextmanager
+    def _hold_restride(self):
+        """Tiles don't re-render for the sizes they pass through while the
+        grid is rearranged; each picks its stride once, from its final size."""
+        held = list(self.panes)
+        for pane in held:
+            pane._hold_restride += 1
+        try:
+            yield
+        finally:
+            for pane in held:
+                pane._hold_restride -= 1
+                if pane in self.panes:
+                    pane._maybe_restride()
+
+    def _rows(self) -> list[QSplitter]:
+        return [self.row_container.widget(i) for i in range(self.row_container.count())]
+
     def _relayout(self):
-        """Rebuild the grid: near-square, rows of horizontal splitters.
-        Panes outside the current display set (soloed away / not flagged
-        while the ★ filter is on) stay alive but hidden and parentless."""
+        """Lay the displayed panes out as rows of horizontal splitters,
+        changing as little as possible: a tile already in its row at its
+        column is left alone, one that shifts within its row is moved
+        without reparenting, and only a tile that changes rows is
+        reparented — the expensive part, which the old rebuild of every
+        tile paid twice over (closing one tile of 48 took 250 ms). Panes
+        outside the display set (soloed away / not flagged while ★ only is
+        on) stay where they are, hidden, as do rows left with nothing to
+        show: a solo hides every other tile in place and un-solo just shows
+        them again."""
         if self.solo_pane is not None and self.solo_pane not in self.panes:
             self.solo_pane = None
-        for pane in self.panes:
-            pane.setParent(None)
-        while self.row_container.count():
-            self.row_container.widget(0).setParent(None)
-
-        shown = self._displayed_panes()
-        hidden = [p for p in self.panes if p not in shown]
-        n = len(shown)
-        if n == 0:
-            return
-        cols = self._grid_cols(n)
-        rows = math.ceil(n / cols)
         handle = 2 if self.minimal_checkbox.isChecked() else 5
         self.row_container.setHandleWidth(handle)
-        for r in range(rows):
+        with self._hold_restride():
+            solo = self.solo_pane
+            if solo is not None and any(row.indexOf(solo) >= 0 for row in self._rows()):
+                self._layout_solo(solo)
+            else:
+                self._layout_grid(self._displayed_panes(), handle)
+
+    def _layout_solo(self, solo: StackPane):
+        for row in self._rows():
+            has_solo = row.indexOf(solo) >= 0
+            for i in range(row.count()):
+                pane = row.widget(i)
+                if pane is solo:
+                    if pane.isHidden():
+                        pane.show()
+                elif not pane.isHidden():
+                    pane.hide()
+            row.setVisible(has_solo)
+
+    def _layout_grid(self, shown: list[StackPane], handle: int):
+        n = len(shown)
+        cols = self._grid_cols(n) if n else 1
+        n_rows = math.ceil(n / cols)
+        rows = self._rows()
+        rows_changed = len(rows) != n_rows
+        while len(rows) < n_rows:
             row = QSplitter(Qt.Horizontal)
             row.setChildrenCollapsible(False)
-            row.setHandleWidth(handle)
-            for pane in shown[r * cols : (r + 1) * cols]:
-                row.addWidget(pane)
-                pane.show()  # may carry an explicit hide from a prior filter
-            row.setSizes([10000 // max(row.count(), 1)] * row.count())
             self.row_container.addWidget(row)
-        self.row_container.setSizes([10000 // rows] * rows)
-        for pane in hidden:
-            pane.hide()
+            rows.append(row)
+        kept, extra = rows[:n_rows], rows[n_rows:]
+        shown_set = set(shown)
+        for r, row in enumerate(kept):
+            row.setHandleWidth(handle)
+            target = shown[r * cols : (r + 1) * cols]
+            touched = False
+            for c, pane in enumerate(target):
+                if row.widget(c) is not pane:
+                    row.insertWidget(c, pane)  # a shift within the row, or a pull from another
+                    touched = True
+                if pane.isHidden():
+                    pane.show()
+                    touched = True
+            # Whatever else the row holds is out of the display set (a tile
+            # bound for a later row is pulled out when that row's turn comes).
+            for i in range(len(target), row.count()):
+                pane = row.widget(i)
+                if pane not in shown_set and not pane.isHidden():
+                    pane.hide()
+            if touched:
+                row.setSizes([10000 // len(target)] * row.count())
+            if row.isHidden():
+                row.show()
+        for row in extra:  # the loop above pulled every displayed tile out of it
+            for i in reversed(range(row.count())):
+                pane = row.widget(i)
+                pane.hide()  # before the move: a splitter shows what it is handed visible
+                if kept:
+                    kept[-1].addWidget(pane)
+            row.hide()
+            row.setParent(None)
+            row.deleteLater()
+        if rows_changed and n_rows:
+            self.row_container.setSizes([10000 // n_rows] * n_rows)
 
     # ---- solo (Enter / header double-click) ----------------------------
 
@@ -1093,9 +1175,8 @@ class WorkspaceWindow(FileDropMixin, QMainWindow):
             super().keyPressEvent(ev)
 
     def closeEvent(self, ev):
-        # Closing the workspace is non-destructive: panes split back to windows.
+        # Closing the grid closes the stacks in it, like closing any stack
+        # window; Cmd+G is the way to split them back into windows.
         if self.panes:
-            ev.ignore()
-            split_all()
-        else:
-            super().closeEvent(ev)
+            self.close_panes(list(self.panes))
+        super().closeEvent(ev)

@@ -74,9 +74,8 @@ def capture() -> dict:
 
 def close_all():
     ws = workspace._workspace
-    if ws is not None:
-        for pane in list(ws.panes):
-            ws.close_pane(pane)
+    if ws is not None and ws.panes:
+        ws.close_panes(list(ws.panes))  # one grid rebuild, not one per tile
     for window in list(viewer._open_windows):
         window.close()
 

@@ -16,7 +16,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from PySide6.QtCore import QEvent, QMimeData, QPoint, QPointF, QSettings, Qt, QUrl
-from PySide6.QtGui import QAction, QKeyEvent
+from PySide6.QtGui import QAction, QKeyEvent, QMouseEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
@@ -192,6 +192,25 @@ ws.grid_combo.setCurrentText("1 column")
 assert ws.row_container.count() == 3
 ws.grid_combo.setCurrentText("Auto")
 ok("grid arrangements")
+# Closing the grid window closes the stacks in it (Cmd+G splits instead).
+extra_close = workspace.show_stack(stack_io.load_stack(SPARE_STACK))
+app.processEvents()
+assert extra_close in ws.panes and extra_close in viewer._all_panes
+ws.close_panes([extra_close])
+app.processEvents()
+closing_ws = workspace.WorkspaceWindow()
+closing_ws.show()
+c1 = viewer.StackPane(stack_io.load_stack(SPARE_STACK))
+c2 = viewer.StackPane(stack_io.load_stack(SPARE_STACK))
+closing_ws.add_panes([c1, c2])
+app.processEvents()
+closing_ws.close()
+app.processEvents()
+assert not closing_ws.panes and c1 not in viewer._all_panes and c2 not in viewer._all_panes
+assert not closing_ws.isVisible() and ws.isVisible() and len(ws.panes) == 3
+closing_ws.deleteLater()
+app.processEvents()
+ok("closing the grid window closes its stacks")
 workspace.set_shared_axes(True)
 app.processEvents()
 ws.shared_bars["z"].set_value(5)
@@ -293,6 +312,26 @@ p1.set_flagged(False)  # last flag gone: filter auto-off, checkbox hides
 app.processEvents()
 assert not ws.flag_checkbox.isChecked() and not ws.flag_checkbox.isVisibleTo(ws)
 assert p2.isVisible() and p3.isVisible()
+# A filter that drops a whole grid row: the row's unflagged tiles are moved
+# into a kept row and must stay hidden there (a splitter shows what it is
+# handed visible).
+p4 = workspace.show_stack(stack_io.load_stack(SPARE_STACK))
+app.processEvents()
+first_row, second_row = ws.panes[:2], ws.panes[2:]  # 4 tiles: 2 columns, 2 rows
+for q in first_row:
+    q.set_flagged(True)
+ws.flag_checkbox.setChecked(True)
+app.processEvents()
+assert all(q.isVisible() for q in first_row) and not any(q.isVisible() for q in second_row)
+assert ws.row_container.count() == 1
+ws.flag_checkbox.setChecked(False)
+app.processEvents()
+assert all(q.isVisible() for q in ws.panes) and ws.row_container.count() == 2
+assert [[ws.panes.index(r.widget(i)) for i in range(r.count())] for r in ws._rows()] == [[0, 1], [2, 3]]
+for q in first_row:
+    q.set_flagged(False)
+ws.close_pane(p4)
+app.processEvents()
 ok("flag (F) + ★-only filter")
 assert workspace._natural_key("XY2.tif") < workspace._natural_key("XY10.tif")
 ws.sort_combo.setCurrentIndex(1)
@@ -657,6 +696,70 @@ assert not viewer._all_panes and not any(b.isChecked() for b in section.checks.v
 assert section.open_all_button.isEnabled() and not section.close_all_button.isEnabled()
 ctrl.remove_folder_section(section)
 ok("folder list open all / close all")
+
+# Range selection in the list: a drag across rows, or a Shift+click after a
+# plain click, opens (or closes) the whole range as one batch; dragging back
+# un-paints rows, a mid-drag sync leaves painted rows alone, and a press on
+# the empty space below the list does nothing.
+ctrl.dropEvent(FakeDrop(mime))
+ctrl.resize(ctrl.width(), 900)  # tall enough for every row to be laid out
+app.processEvents()
+section = next(iter(ctrl.folder_sections.values()))
+flist = section.list
+assert [b.text() for b in flist.boxes] == [f.name for f in section.checks]
+
+
+def row_point(i):
+    return QPointF(flist.boxes[i].geometry().center())
+
+
+def mouse(kind, pos, mods=Qt.NoModifier):
+    ev = QMouseEvent(kind, pos, flist.mapToGlobal(pos.toPoint()), Qt.LeftButton,
+                     Qt.LeftButton if kind != QEvent.MouseButtonRelease else Qt.NoButton, mods)
+    app.sendEvent(flist, ev)
+    app.processEvents()
+
+
+mouse(QEvent.MouseButtonPress, row_point(0))
+mouse(QEvent.MouseMove, row_point(3))
+assert [b.isChecked() for b in flist.boxes[:5]] == [True] * 4 + [False]
+assert not viewer._all_panes  # nothing opens before release
+mouse(QEvent.MouseMove, row_point(1))  # dragging back un-paints rows
+assert [b.isChecked() for b in flist.boxes[:4]] == [True, True, False, False]
+mouse(QEvent.MouseMove, row_point(2))
+section.sync(set())  # a refresh mid-drag must not undo the preview
+assert [b.isChecked() for b in flist.boxes[:3]] == [True] * 3
+mouse(QEvent.MouseButtonRelease, row_point(2))
+assert len(viewer._all_panes) == 3, len(viewer._all_panes)
+assert [b.isChecked() for b in flist.boxes[:4]] == [True, True, True, False]
+# Shift+click extends from the row the drag started on, over rows already
+# open; only the still-closed ones are opened.
+mouse(QEvent.MouseButtonPress, row_point(4), Qt.ShiftModifier)
+mouse(QEvent.MouseButtonRelease, row_point(4), Qt.ShiftModifier)
+assert len(viewer._all_panes) == 5, len(viewer._all_panes)
+assert all(b.isChecked() for b in flist.boxes[:5])
+# A plain click on an open row closes just that one; the drag anchor moves.
+mouse(QEvent.MouseButtonPress, row_point(2))
+mouse(QEvent.MouseButtonRelease, row_point(2))
+assert len(viewer._all_panes) == 4 and not flist.boxes[2].isChecked()
+# Shift+click on an open row paints "closed" from the anchor to it.
+mouse(QEvent.MouseButtonPress, row_point(0), Qt.ShiftModifier)
+mouse(QEvent.MouseButtonRelease, row_point(0), Qt.ShiftModifier)
+assert len(viewer._all_panes) == 2, len(viewer._all_panes)
+assert [b.isChecked() for b in flist.boxes[:5]] == [False, False, False, True, True]
+# Dragging past the last row runs to the end; the empty space below is inert.
+below = QPointF(10, flist.boxes[-1].geometry().bottom() + 30)
+mouse(QEvent.MouseButtonPress, below)
+mouse(QEvent.MouseButtonRelease, below)
+assert len(viewer._all_panes) == 2 and flist.row_at(int(below.y())) is None
+assert flist.row_at(int(below.y()), clamp=True) == len(flist.boxes) - 1
+mouse(QEvent.MouseButtonPress, row_point(3))
+mouse(QEvent.MouseMove, below)
+mouse(QEvent.MouseButtonRelease, below)
+assert not viewer._all_panes and not any(b.isChecked() for b in flist.boxes)
+ctrl.remove_folder_section(section)
+app.processEvents()
+ok("folder list: drag and Shift+click open/close a range in one batch")
 
 # A tall saved geometry (window stretched for folder lists) must not carry
 # over to a fresh start, where no folder sections exist yet.
@@ -1152,8 +1255,9 @@ def shows_current_ranges(q):
     return np.array_equal(q.image_item.image, rgb)
 
 
-assert shows_current_ranges(rb)  # single plane: the only render predates the ranges
-assert ra.position()[:2] == (5, 4) and shows_current_ranges(ra)
+# A pane's first on-screen render lands from the render pool after it shows.
+assert wait_until(lambda: shows_current_ranges(rb))  # single plane: the preview predates the ranges
+assert ra.position()[:2] == (5, 4) and wait_until(lambda: shows_current_ranges(ra))
 ra.bars["t"].set_value(0)
 ra.bars["z"].set_value(0)
 assert shows_current_ranges(ra)  # scrubbing back to the plane cached at load
@@ -1868,6 +1972,195 @@ assert not any(box.isChecked() for box in section.checks.values())
 cw.remove_folder_section(section)
 app.processEvents()
 ok("folder list: natural order, ._ files skipped, relative/symlinked paths match")
+
+# Plate layouts (pLayout .plate files) attached to a folder section: wells map
+# to stacks by XY position (XY2 == XY02) or, without an XY factor, by a well
+# label in the file name; a click on a well opens its stack, a click in
+# replicate mode opens every well sharing the grouping factors' values, and
+# the plate follows what is open like the checkboxes do.
+import json  # noqa: E402
+
+from tiff_visualizer import plate as plate_mod  # noqa: E402
+
+plate_folder = Path(TMP) / "platefolder"
+plate_folder.mkdir()
+for name in ("XY01.tif", "XY2.tif", "XY03.tif", "B02.tif"):
+    tifffile.imwrite(plate_folder / name, np.zeros((2, 16, 16), np.uint16), imagej=True)
+plate_path = Path(TMP) / "two-drugs.plate"
+plate_path.write_text(json.dumps({
+    "version": 1,
+    "factors": [
+        {"id": "f-drug", "name": "Drug", "kind": "numeric", "unit": "µM", "levels": [
+            {"id": "d10", "name": "10", "colorHex": "#3A70A4"},
+            {"id": "d0", "name": "0", "colorHex": "#E8E8E8"}]},
+        {"id": "f-xy", "name": "XY", "levels": [
+            {"id": f"x{i}", "name": f"XY0{i}", "colorHex": "#444444"} for i in (1, 2, 3, 4)]},
+    ],
+    "plates": [{"name": "Plate 1", "format": {"rows": 2, "cols": 3},
+                "assignments": {"f-drug": ["d10", "d10", "d0", "d0", None, None],
+                                "f-xy": ["x1", "x2", "x3", "x4", None, None]},
+                "wellNotes": {"0": "bubble"}}],
+}), encoding="utf-8")
+cw.add_folder_section(plate_folder)
+psec = cw.folder_sections[str(plate_folder.resolve())]
+cw.open_plate(plate_path, psec)
+panel = psec.plate_panel
+pk = lambda name: control_panel._canonical(plate_folder / name)  # noqa: E731
+open_keys = lambda: {control_panel._canonical(q.stack.path) for q in viewer._all_panes if q.stack.path}  # noqa: E731
+assert panel.view.files == {0: [pk("XY01.tif")], 1: [pk("XY2.tif")], 2: [pk("XY03.tif")]}
+assert panel.status.text().startswith("3 of 6 wells") and "XY position" in panel.status.text()
+tip = panel.view.tooltip_for(0)
+assert all(x in tip for x in ("A1", "XY01", "Drug: 10 µM", "bubble", "XY01.tif  (closed)"))
+assert panel.mode_combo.currentData() == "f-drug"  # the first real factor, not XY
+assert psec.pages.currentWidget() is panel and psec.view_button.isChecked()
+
+
+def plate_click(view, well, alt=False, mods=None):
+    view.resize(300, view.heightForWidth(300))
+    pos = view.well_rect(well).center()
+    if mods is None:
+        mods = Qt.AltModifier if alt else Qt.NoModifier
+    for kind, buttons in ((QEvent.MouseButtonPress, Qt.LeftButton), (QEvent.MouseButtonRelease, Qt.NoButton)):
+        ev = QMouseEvent(kind, pos, view.mapToGlobal(pos.toPoint()), Qt.LeftButton, buttons, mods)
+        app.sendEvent(view, ev)
+    app.processEvents()
+
+
+plate_click(panel.view, 0)
+assert pk("XY01.tif") in open_keys() and pk("XY2.tif") not in open_keys()
+assert panel.view.well_state(0) == "open" and psec.checks[pk("XY01.tif")].isChecked()
+pane01 = next(q for q in viewer._all_panes if control_panel._canonical(q.stack.path) == pk("XY01.tif"))
+assert pane01.header_label.toolTip() == "A1  ·  Drug 10 µM"
+# Replicates: Drug is the only grouping factor, so A1+A2 (10) and A3+B1 (0)
+# form the groups; blank wells stay out.
+panel.mode_combo.setCurrentIndex(panel.mode_combo.findData(plate_mod.REPLICATES))
+assert panel.group_button.isVisible() or not panel.isVisible()
+assert panel.view.group_of(0) == panel.view.group_of(1) != panel.view.group_of(2) == panel.view.group_of(3)
+assert panel.view.group_of(4) is None
+# Labels: the grouping factors' values, stacked, while the wells are big enough
+# to read them; the group number once they are not. XY is offered for grouping
+# but starts unchecked (it would make every well unique).
+assert panel.view.label_lines(0) == ["10"] and panel.view.label_lines(3) == ["0"]
+assert panel.view.label_lines(4) == []
+assert [a.text() for a in panel.group_actions] == ["Drug (µM)", "XY"]
+assert [a.isChecked() for a in panel.group_actions] == [True, False]
+big = panel.view.fitted_label(0, 40.0, 40.0)
+assert big is not None and big[2] == ["10"] and big[0].pointSizeF() >= plate_mod.PlateView.MIN_TEXT_PT
+tiny = panel.view.fitted_label(0, 9.0, 9.0)
+assert tiny[2] == ["1"] and tiny[0].pointSizeF() == plate_mod.PlateView.MIN_TEXT_PT  # the group number
+panel.group_actions[1].setChecked(True)  # group by Drug and XY: every well on its own
+assert panel.view.label_lines(0) == ["10", "XY01"] and panel.view.group_of(0) != panel.view.group_of(1)
+assert panel.view.fitted_label(0, 60.0, 60.0)[2] == ["10", "XY01"]
+assert panel.view.fitted_label(0, 60.0, 14.0)[2] == ["10  ·  XY01"]  # one line when two don't fit
+assert panel.view.fitted_label(0, 24.0, 14.0)[2] == ["1"]
+panel.group_actions[1].setChecked(False)
+assert panel.view.group_of(0) == panel.view.group_of(1)
+plate_click(panel.view, 1)  # A2's group: XY01 already open, so the click opens
+assert {pk("XY01.tif"), pk("XY2.tif")} <= open_keys() and pk("XY03.tif") not in open_keys()
+plate_click(panel.view, 0)  # the whole group is open: closes it
+assert not ({pk("XY01.tif"), pk("XY2.tif")} & open_keys())
+plate_click(panel.view, 1, alt=True)  # Alt: this well alone
+assert pk("XY2.tif") in open_keys() and pk("XY01.tif") not in open_keys()
+plate_click(panel.view, 0, mods=Qt.ControlModifier)  # Cmd on a Mac: this well alone too
+assert {pk("XY01.tif"), pk("XY2.tif")} <= open_keys()
+plate_click(panel.view, 0, mods=Qt.ControlModifier)
+assert pk("XY2.tif") in open_keys() and pk("XY01.tif") not in open_keys()
+assert [panel.view.well_state(w) for w in (0, 1, 3)] == ["closed", "open", "none"]
+# A factor hidden in pLayout's Overview (saved as hiddenInOverview) is out of
+# the grouping by default, and the Group-by label says which are in.
+hidden_doc = plate_mod.load_plate(plate_path)
+hidden_doc.factors[0].hidden_in_overview = True
+assert plate_mod.default_group_factors(hidden_doc) == ["f-drug"]  # all hidden: back to all non-XY
+hidden_doc.factors.insert(0, plate_mod.Factor("f-cell", "Cells", "", {"c1": plate_mod.Level("c1", "HeLa", "#808080")}))
+assert plate_mod.default_group_factors(hidden_doc) == ["f-cell"]
+hidden_panel = plate_mod.PlatePanel(hidden_doc)
+assert [a.isChecked() for a in hidden_panel.group_actions] == [True, False, False]
+assert hidden_panel.group_button.text() == "Group by: Cells ▾"
+hidden_panel.deleteLater()
+# Without an XY factor, wells go by a label in the file name: B02.tif is B2.
+doc2 = plate_mod.PlateLayout(plate_path, [], [plate_mod.Plate("P", 2, 3, {}, {})])
+mapping, how = plate_mod.match_files(doc2, doc2.plates[0], psec.listed)
+assert mapping == {4: [pk("B02.tif")]} and how == "well name"
+# Several plates in one layout: a file naming a plate (p2_XY01, Plate_2_XY01,
+# plate2_XY01) counts for that plate only; one naming none stands in where
+# nothing names this plate; a project code's P06 names no plate.
+xyf = plate_mod.Factor("f-xy", "XY", "", {"x1": plate_mod.Level("x1", "XY01", "#444444"),
+                                           "x2": plate_mod.Level("x2", "XY02", "#444444")})
+two = plate_mod.PlateLayout(plate_path, [xyf], [
+    plate_mod.Plate("p1", 1, 2, {"f-xy": ["x1", "x2"]}, {}),
+    plate_mod.Plate("p2", 1, 2, {"f-xy": ["x1", "x2"]}, {})])
+fake = {Path(n): Path(n) for n in ("p1_XY01.tif", "p2_XY01.tif", "XY02.tif", "20260805_LN_P06-022_XY02.tif")}
+m1, _ = plate_mod.match_files(two, two.plates[0], fake)
+m2, _ = plate_mod.match_files(two, two.plates[1], fake)
+assert m1 == {0: [Path("p1_XY01.tif")], 1: [Path("XY02.tif"), Path("20260805_LN_P06-022_XY02.tif")]}
+assert m2 == {0: [Path("p2_XY01.tif")], 1: [Path("XY02.tif"), Path("20260805_LN_P06-022_XY02.tif")]}
+named = plate_mod.PlateLayout(plate_path, [xyf], [
+    plate_mod.Plate("Plate 1", 1, 2, {"f-xy": ["x1", "x2"]}, {}),
+    plate_mod.Plate("Plate 2", 1, 2, {"f-xy": ["x1", "x2"]}, {})])
+assert plate_mod.file_plate(named, "Plate_2_XY01") is named.plates[1]
+assert plate_mod.file_plate(named, "plate1_XY01") is named.plates[0]
+assert plate_mod.file_plate(named, "p2_XY01") is named.plates[1]
+assert plate_mod.file_plate(named, "20260805_LN_P06-022_XY02") is None
+assert plate_mod.file_plate(doc2, "p1_XY01") is None  # a single plate: nothing to tell apart
+# The pairing is remembered both ways: the folder brings its plate back, and
+# the plate (opened from Finder with no section around) brings its folder.
+psec.close_all()
+app.processEvents()
+cw.remove_folder_section(psec)
+app.processEvents()
+cw.add_folder_section(plate_folder)
+psec = cw.folder_sections[str(plate_folder.resolve())]
+assert psec.plate_panel is not None and psec.plate_panel.doc.path.resolve() == plate_path.resolve()
+cw.remove_folder_section(psec)
+app.processEvents()
+cw.open_plate(plate_path)
+psec = cw.folder_sections[str(plate_folder.resolve())]
+assert psec.pages.currentWidget() is psec.plate_panel
+psec.view_button.setChecked(False)
+assert psec.pages.currentWidget() is psec.scroll
+# Explicit link and unlink. The ✕ on the plate's row drops the plate: the
+# list is back, both sides of the pairing are forgotten (re-dropping the
+# folder brings no plate), open stacks stay open and lose the conditions
+# tooltip. The "Plate layout…" button under a list links a file to that
+# section — not to whichever section a drop would have guessed.
+psec.view_button.setChecked(True)
+plate_click(psec.plate_panel.view, 0)
+pane01 = next(q for q in viewer._all_panes if control_panel._canonical(q.stack.path) == pk("XY01.tif"))
+assert pane01.header_label.toolTip() == "A1  ·  Drug 10 µM" and psec.plate_button.isHidden()
+psec.plate_panel.unlink_button.click()
+app.processEvents()
+assert psec.plate_panel is None and psec.pages.currentWidget() is psec.scroll
+assert psec.view_button.isHidden() and not psec.plate_button.isHidden()
+assert pk("XY01.tif") in open_keys() and psec.checks[pk("XY01.tif")].isChecked()
+assert pane01.header_label.toolTip() == ""
+assert control_panel._remembered_plate(plate_folder) is None
+assert control_panel._remembered_folder(plate_path) is None
+cw.remove_folder_section(psec)
+app.processEvents()
+other_folder = Path(TMP) / "otherfolder"
+other_folder.mkdir()
+tifffile.imwrite(other_folder / "XY01.tif", np.zeros((2, 16, 16), np.uint16), imagej=True)
+osec = cw.add_folder_section(other_folder)
+psec = cw.add_folder_section(plate_folder)
+assert psec.plate_panel is None and osec.plate_panel is None
+real_open_dialog = QFileDialog.getOpenFileName
+QFileDialog.getOpenFileName = staticmethod(lambda *a, **k: (str(plate_path), ""))
+try:
+    psec.plate_button.click()
+    app.processEvents()
+finally:
+    QFileDialog.getOpenFileName = real_open_dialog
+assert psec.plate_panel is not None and psec.plate_panel.doc.path.resolve() == plate_path.resolve()
+assert osec.plate_panel is None and psec.plate_button.isHidden()
+assert psec.pages.currentWidget() is psec.plate_panel and psec.view_button.isChecked()
+assert control_panel._remembered_plate(plate_folder).resolve() == plate_path.resolve()
+assert pane01.header_label.toolTip() == "A1  ·  Drug 10 µM"  # conditions are back
+psec.close_all()
+app.processEvents()
+for sec in (psec, osec):
+    cw.remove_folder_section(sec)
+app.processEvents()
+ok("plate layouts: XY/well-name matching, click opens, replicate groups, pairing remembered, link/unlink")
 
 # Finder/Dock opens: a burst of FileOpen events becomes one batched open of
 # absolute paths — symlinks kept, so a link keeps its name (argv goes

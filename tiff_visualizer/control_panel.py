@@ -7,27 +7,36 @@ active stack (last clicked). Closing it quits the app.
 from __future__ import annotations
 
 import functools
+import json
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QColor, QCursor, QPainter
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
     QCheckBox,
+    QFileDialog,
     QGridLayout,
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QStackedWidget,
     QStyle,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
+from . import plate as plate_mod
+from . import settings as app_settings
 from . import viewer, workspace
 from .viewer import FileDropMixin, StackPane, build_menus
 
@@ -73,9 +82,239 @@ def _close_stacks_by_paths(paths: set):
                 window.close()
 
 
+def _plate_bindings() -> dict[str, dict[str, str]]:
+    """Which plate a folder was last shown with, and which folder a plate:
+    dropping either again brings the other back (JSON in QSettings)."""
+    raw = app_settings.settings().value("plates/bindings", "", type=str)
+    try:
+        data = json.loads(raw) if raw else {}
+    except ValueError:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    return {k: dict(data.get(k) or {}) for k in ("by_folder", "by_plate")}
+
+
+def _remember_plate(folder: Path, plate_path: Path):
+    data = _plate_bindings()
+    folder_key, plate_key = str(Path(folder).resolve()), str(Path(plate_path).resolve())
+    for table, key, value in (("by_folder", folder_key, plate_key), ("by_plate", plate_key, folder_key)):
+        d = data[table]
+        d.pop(key, None)
+        d[key] = value
+        while len(d) > 50:  # oldest first: dicts keep insertion order
+            del d[next(iter(d))]
+    app_settings.settings().setValue("plates/bindings", json.dumps(data))
+
+
+def _remembered_plate(folder: Path) -> Path | None:
+    value = _plate_bindings()["by_folder"].get(str(Path(folder).resolve()))
+    return Path(value) if value else None
+
+
+def _remembered_folder(plate_path: Path) -> Path | None:
+    value = _plate_bindings()["by_plate"].get(str(Path(plate_path).resolve()))
+    return Path(value) if value else None
+
+
+def _forget_plate(folder: Path, plate_path: Path):
+    """Unlinking: neither side brings the other back any more."""
+    data = _plate_bindings()
+    folder_key, plate_key = str(Path(folder).resolve()), str(Path(plate_path).resolve())
+    if data["by_folder"].get(folder_key) == plate_key:
+        del data["by_folder"][folder_key]
+    if data["by_plate"].get(plate_key) == folder_key:
+        del data["by_plate"][plate_key]
+    app_settings.settings().setValue("plates/bindings", json.dumps(data))
+
+
+@dataclass
+class _RangeDrag:
+    """One press on the file list until its release: the row the range
+    grows from, the state it paints (open or closed), every row's state
+    before the press, and the rows painted so far."""
+
+    anchor: int
+    target: bool
+    before: list[bool]
+    rows: range = range(0)
+
+
+class FileList(QWidget):
+    """The checkbox column of a folder section, selectable like a file
+    manager's list: press on a row and drag across others, or Shift+click
+    after a plain click, and the whole range takes that row's new state —
+    open or closed — committed as one batch on release. A click anywhere on
+    a row counts, so the boxes themselves ignore the mouse (keyboard
+    toggling through them still works); the hovered row is tinted.
+    """
+
+    def __init__(self, on_apply: Callable[[list[int], bool], None]):
+        super().__init__()
+        self._on_apply = on_apply
+        self.boxes: list[QCheckBox] = []
+        # Row of the last plain press: where a Shift+click range grows from.
+        self._anchor: int | None = None
+        self._drag: _RangeDrag | None = None
+        self._hover: int | None = None
+        self.setMouseTracking(True)
+        self.setToolTip(
+            "Click a file to open or close it.\n"
+            "Drag across files, or Shift+click, to open or close a whole range."
+        )
+        # Keeps the list scrolling while a drag is held past its top or
+        # bottom edge; move events stop once the cursor stops.
+        self._scroll_timer = QTimer(self)
+        self._scroll_timer.setInterval(40)
+        self._scroll_timer.timeout.connect(self._autoscroll)
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(8, 0, 0, 0)
+        self._layout.setSpacing(2)
+        self._layout.addStretch(1)
+
+    def add(self, box: QCheckBox):
+        box.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self._layout.insertWidget(len(self.boxes), box)
+        self.boxes.append(box)
+
+    def painted_rows(self) -> range:
+        """Rows a held drag is previewing; a sync must leave them alone."""
+        return self._drag.rows if self._drag is not None else range(0)
+
+    def row_at(self, y: int, clamp: bool = False) -> int | None:
+        """The row at this y (list coordinates). Outside the rows: the
+        nearest end when clamping (a drag past the end runs to the end),
+        else None (a press on the empty space below the list does nothing)."""
+        if not self.boxes:
+            return None
+        if y < self.boxes[0].geometry().top():
+            return 0 if clamp else None
+        if y > self.boxes[-1].geometry().bottom():
+            return len(self.boxes) - 1 if clamp else None
+        for i, box in enumerate(self.boxes):
+            if y <= box.geometry().bottom():
+                return i
+        return len(self.boxes) - 1
+
+    # ---- mouse ---------------------------------------------------------
+
+    def mousePressEvent(self, ev):
+        row = self.row_at(ev.position().toPoint().y())
+        if ev.button() != Qt.LeftButton or row is None:
+            super().mousePressEvent(ev)
+            return
+        if not (ev.modifiers() & Qt.ShiftModifier) or self._anchor is None:
+            self._anchor = row
+        self._drag = _RangeDrag(
+            self._anchor,
+            not self.boxes[row].isChecked(),
+            [box.isChecked() for box in self.boxes],
+        )
+        self._paint(row)
+        ev.accept()
+
+    def mouseMoveEvent(self, ev):
+        y = ev.position().toPoint().y()
+        if self._drag is not None:
+            self._paint(self.row_at(y, clamp=True))
+            self._check_autoscroll()
+        self._set_hover(self.row_at(y))
+
+    def mouseReleaseEvent(self, ev):
+        if ev.button() != Qt.LeftButton or self._drag is None:
+            super().mouseReleaseEvent(ev)
+            return
+        drag, self._drag = self._drag, None
+        self._scroll_timer.stop()
+        self._on_apply([i for i in drag.rows if drag.before[i] != drag.target], drag.target)
+        ev.accept()
+
+    def leaveEvent(self, ev):
+        self._set_hover(None)
+        super().leaveEvent(ev)
+
+    def _paint(self, row: int):
+        """Preview the range anchor..row in the boxes — signals blocked, the
+        stacks only open or close on release — and restore rows that left it."""
+        drag = self._drag
+        rows = range(min(drag.anchor, row), max(drag.anchor, row) + 1)
+        if rows == drag.rows:
+            return
+        drag.rows = rows
+        for i, box in enumerate(self.boxes):
+            want = drag.target if i in rows else drag.before[i]
+            if box.isChecked() != want:
+                box.blockSignals(True)
+                box.setChecked(want)
+                box.blockSignals(False)
+
+    def _set_hover(self, row: int | None):
+        if row != self._hover:
+            self._hover = row
+            self.update()
+
+    def paintEvent(self, ev):
+        super().paintEvent(ev)
+        if self._hover is not None and self._hover < len(self.boxes):
+            rect = self.boxes[self._hover].geometry().adjusted(0, -1, 0, 1)
+            rect.setLeft(0)
+            rect.setRight(self.width() - 1)
+            QPainter(self).fillRect(rect, QColor(255, 255, 255, 18))
+
+    # ---- auto-scroll while dragging past the edges ---------------------
+
+    def _scroll_area(self) -> QScrollArea | None:
+        widget = self.parentWidget()
+        while widget is not None and not isinstance(widget, QScrollArea):
+            widget = widget.parentWidget()
+        return widget
+
+    def _check_autoscroll(self):
+        scroll = self._scroll_area()
+        if scroll is None:
+            return
+        y = scroll.viewport().mapFromGlobal(QCursor.pos()).y()
+        if 0 <= y < scroll.viewport().height():
+            self._scroll_timer.stop()
+        elif not self._scroll_timer.isActive():
+            self._scroll_timer.start()
+
+    def _autoscroll(self):
+        scroll = self._scroll_area()
+        if self._drag is None or scroll is None:
+            self._scroll_timer.stop()
+            return
+        pos = QCursor.pos()
+        height = scroll.viewport().height()
+        y = scroll.viewport().mapFromGlobal(pos).y()
+        if 0 <= y < height:
+            self._scroll_timer.stop()
+            return
+        # Faster the farther past the edge, like a file manager's list.
+        overshoot = -y if y < 0 else y - height + 1
+        step = min(4 + overshoot // 3, 48)
+        bar = scroll.verticalScrollBar()
+        bar.setValue(bar.value() + (step if y >= height else -step))
+        self._paint(self.row_at(self.mapFromGlobal(pos).y(), clamp=True))
+
+
+class _Pages(QStackedWidget):
+    """Sized by the page on show rather than the tallest page, so the
+    control window fits whichever face of the folder is up."""
+
+    def sizeHint(self):
+        w = self.currentWidget()
+        return w.sizeHint() if w is not None else super().sizeHint()
+
+    def minimumSizeHint(self):
+        w = self.currentWidget()
+        return w.minimumSizeHint() if w is not None else super().minimumSizeHint()
+
+
 class FolderSection(QWidget):
     """A dropped folder: header (icon, name, ✕) plus a checkbox per TIFF.
-    Checking opens the stack, unchecking closes it."""
+    Checking opens the stack, unchecking closes it; a drag across rows or a
+    Shift+click does a whole range at once (see FileList)."""
 
     def __init__(self, path: Path, owner: "ControlWindow"):
         super().__init__()
@@ -97,17 +336,23 @@ class FolderSection(QWidget):
         close_button.setToolTip("Remove this folder list (open stacks stay open)")
         close_button.setFocusPolicy(Qt.NoFocus)
         close_button.clicked.connect(lambda: owner.remove_folder_section(self))
+        # Appears once a plate layout is attached: flips between the plate
+        # and the plain file list (same files, same open/close).
+        self.view_button = QToolButton()
+        self.view_button.setCheckable(True)
+        self.view_button.setFocusPolicy(Qt.NoFocus)
+        self.view_button.toggled.connect(self._show_plate)
+        self.view_button.hide()
         header.addWidget(icon_label)
         header.addWidget(name_label, 1)
+        header.addWidget(self.view_button)
         header.addWidget(close_button)
         layout.addLayout(header)
 
-        files_widget = QWidget()
-        files_layout = QVBoxLayout(files_widget)
-        files_layout.setContentsMargins(8, 0, 0, 0)
-        files_layout.setSpacing(2)
+        self.list = FileList(self._apply_rows)
         # Keyed by canonical path to match open stacks; opened and labeled as
-        # listed, so a symlinked position keeps its own name.
+        # listed, so a symlinked position keeps its own name. Insertion order
+        # is the list's row order.
         self.checks: dict[Path, QCheckBox] = {}
         self.listed: dict[Path, Path] = {}
         open_paths = _open_stack_paths()
@@ -115,19 +360,24 @@ class FolderSection(QWidget):
             key = _canonical(file)
             box = QCheckBox(file.name)
             box.setChecked(key in open_paths)
-            box.toggled.connect(lambda on, f=key: self._on_toggled(f, on))
-            files_layout.addWidget(box)
+            # Keyboard (Space) and programmatic toggles; mouse goes through
+            # the list, which commits a whole range in one batch.
+            box.toggled.connect(lambda on, f=key: self._apply([f], on))
+            self.list.add(box)
             self.checks[key] = box
             self.listed[key] = file
-        files_layout.addStretch(1)
 
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setFrameShape(QScrollArea.NoFrame)
-        self.scroll.setWidget(files_widget)
+        self.scroll.setWidget(self.list)
         self.scroll.setMinimumHeight(80)
         # No height cap: the list stretches with the window, scrolls when short.
-        layout.addWidget(self.scroll, 1)
+        # The list and, once one is attached, the plate layout share this slot.
+        self.pages = _Pages()
+        self.pages.addWidget(self.scroll)
+        layout.addWidget(self.pages, 1)
+        self.plate_panel: plate_mod.PlatePanel | None = None
 
         # Bulk actions under the list: check/uncheck every box in one pass.
         actions = QHBoxLayout()
@@ -145,8 +395,25 @@ class FolderSection(QWidget):
             b.clicked.connect(slot)
             actions.addWidget(b)
         actions.addStretch(1)
+        # The explicit way in (a drop works too): pick a pLayout file for
+        # this folder. Gone while a plate is linked — its own row has the ✕.
+        self.plate_button = QPushButton("Plate layout…")
+        self.plate_button.setToolTip(
+            "Link a pLayout .plate file to this folder: its wells open these stacks\n"
+            "(dropping a .plate file onto the list does the same)"
+        )
+        self.plate_button.setFocusPolicy(Qt.NoFocus)
+        self.plate_button.clicked.connect(lambda: owner.open_plate_dialog(self))
+        actions.addWidget(self.plate_button)
         layout.addLayout(actions)
         self.sync(open_paths)
+        # The plate this folder was last shown with comes back with it.
+        remembered = _remembered_plate(path)
+        if remembered is not None and remembered.is_file():
+            try:
+                self.attach_plate(remembered)
+            except ValueError:
+                pass
 
     def open_all(self):
         """Open every stack in this folder that isn't open yet."""
@@ -157,10 +424,16 @@ class FolderSection(QWidget):
         self._set_all(False)
 
     def _set_all(self, on: bool):
-        # One batched open/close for the whole folder, with the control
-        # window's own refreshes held off until it is done; the boxes then
-        # sync once from what is actually open.
-        files = [f for f, box in self.checks.items() if box.isChecked() != on]
+        self._apply([f for f, box in self.checks.items() if box.isChecked() != on], on)
+
+    def _apply_rows(self, rows: list[int], on: bool):
+        keys = list(self.checks)
+        self._apply([keys[i] for i in rows], on)
+
+    def _apply(self, files: list[Path], on: bool):
+        """Open or close these files as one batch, with the control window's
+        own refreshes held off until it is done; the boxes then sync once
+        from what is actually open."""
         if not files:
             return
         with self.owner.bulk_update():
@@ -168,16 +441,10 @@ class FolderSection(QWidget):
                 viewer.open_paths([self.listed[f] for f in files], self)
             else:
                 _close_stacks_by_paths(set(files))
-        self.owner.statusBar().showMessage(
-            f"{'Opened' if on else 'Closed'} {len(files)} stacks · {self.path.name}", 4000
-        )
-
-    def _on_toggled(self, file: Path, on: bool):
-        if on:
-            viewer.open_path(self.listed[file], self)
-        else:
-            _close_stack_by_path(file)
-        self.owner.refresh_state()
+        if len(files) > 1:
+            self.owner.statusBar().showMessage(
+                f"{'Opened' if on else 'Closed'} {len(files)} stacks · {self.path.name}", 4000
+            )
 
     def sync(self, open_paths: set):
         """Reflect reality: stacks opened/closed elsewhere update the boxes.
@@ -185,17 +452,88 @@ class FolderSection(QWidget):
         Signals are blocked per box rather than muted with a flag: opening a
         stack refreshes the control window, so this can run nested inside a
         batch and must not re-enable the per-file handler behind its back.
+        Rows a held drag is previewing are left to the drag.
         """
         n_open = 0
-        for file, box in self.checks.items():
+        painted = self.list.painted_rows()
+        for i, (file, box) in enumerate(self.checks.items()):
             is_open = file in open_paths
             n_open += is_open
-            if box.isChecked() != is_open:
+            if i not in painted and box.isChecked() != is_open:
                 box.blockSignals(True)
                 box.setChecked(is_open)
                 box.blockSignals(False)
         self.open_all_button.setEnabled(n_open < len(self.checks))
         self.close_all_button.setEnabled(n_open > 0)
+        if self.plate_panel is not None:
+            self.plate_panel.set_open(open_paths)
+            self._label_panes()
+
+    # ---- plate layouts -------------------------------------------------
+
+    def attach_plate(self, path: Path) -> "plate_mod.PlatePanel":
+        """Show a pLayout .plate file as a face of this folder: its wells map
+        to the listed stacks by name (plate.match_files). Replaces a plate
+        attached before. Raises ValueError for a file that isn't a layout."""
+        doc = plate_mod.load_plate(path)
+        if self.plate_panel is not None:
+            self.pages.removeWidget(self.plate_panel)
+            self.plate_panel.deleteLater()
+        panel = plate_mod.PlatePanel(doc)
+        panel.set_files(self.listed)
+        panel.toggle.connect(self._apply)
+        panel.unlink.connect(self.detach_plate)
+        self.plate_panel = panel
+        self.pages.addWidget(panel)
+        self.plate_button.hide()
+        self.view_button.show()
+        self.view_button.setChecked(True)
+        self._show_plate(True)
+        _remember_plate(self.path, path)
+        self.sync(_open_stack_paths())
+        return panel
+
+    def detach_plate(self):
+        """Unlink the plate (the ✕ on its row): back to the plain file list,
+        and the pairing is forgotten, so neither the folder nor the plate
+        brings the other back. Open stacks stay open; their headers drop
+        the well conditions."""
+        if self.plate_panel is None:
+            return
+        panel, self.plate_panel = self.plate_panel, None
+        plate_path = panel.doc.path
+        self.pages.removeWidget(panel)
+        panel.deleteLater()
+        self.view_button.setChecked(False)
+        self.view_button.hide()
+        self._show_plate(False)
+        self.plate_button.show()
+        _forget_plate(self.path, plate_path)
+        for pane in viewer._all_panes:
+            if pane.stack.path and _canonical(pane.stack.path) in self.checks:
+                pane.header_label.setToolTip("")
+        self.owner.statusBar().showMessage(f"{plate_path.name} unlinked from {self.path.name}", 4000)
+        # Shrink after the layout has processed the swap.
+        QTimer.singleShot(0, self.owner.adjustSize)
+
+    def _show_plate(self, on: bool):
+        if self.plate_panel is None:
+            on = False
+        self.pages.setCurrentWidget(self.plate_panel if on else self.scroll)
+        if self.plate_panel is not None:
+            self.plate_panel.view.fit_height(on)
+        self.view_button.setText("☰" if on else "⊞")
+        self.view_button.setToolTip("Show the file list" if on else "Show the plate layout")
+
+    def _label_panes(self):
+        """Tell every open stack which well it came from: the pane header's
+        tooltip reads `B3  ·  Drug A 10 µM  ·  Drug B 0 µM`."""
+        for pane in viewer._all_panes:
+            if not pane.stack.path:
+                continue
+            text = self.plate_panel.conditions_for(_canonical(pane.stack.path))
+            if text:
+                pane.header_label.setToolTip(text)
 
 _instance: "ControlWindow | None" = None
 
@@ -371,36 +709,55 @@ class ControlWindow(FileDropMixin, QMainWindow):
             return []
         return [Path(u.toLocalFile()) for u in mime.urls() if Path(u.toLocalFile()).is_dir()]
 
+    @staticmethod
+    def _dropped_plates(mime) -> list[Path]:
+        if not mime.hasUrls():
+            return []
+        paths = [Path(u.toLocalFile()) for u in mime.urls()]
+        return [p for p in paths if p.is_file() and plate_mod.is_plate_name(p.name)]
+
     def dragEnterEvent(self, ev):
-        if self._dropped_dirs(ev.mimeData()) or self._dropped_tiff_paths(ev.mimeData()):
+        mime = ev.mimeData()
+        if self._dropped_dirs(mime) or self._dropped_tiff_paths(mime) or self._dropped_plates(mime):
             ev.acceptProposedAction()
         else:
             ev.ignore()
 
     def dropEvent(self, ev):
         handled = False
+        added: list[FolderSection] = []
         with self.bulk_update():
             for directory in self._dropped_dirs(ev.mimeData()):
-                self.add_folder_section(directory)
+                if (section := self.add_folder_section(directory)) is not None:
+                    added.append(section)
                 handled = True
             if paths := self._dropped_tiff_paths(ev.mimeData()):
                 viewer.open_paths(paths, self)
                 handled = True
+        # A plate dropped with a folder attaches to that folder; dropped on a
+        # section, to that one; else wherever open_plate works out.
+        for plate_path in self._dropped_plates(ev.mimeData()):
+            target = added[0] if added else self._section_at(ev.position().toPoint())
+            self.open_plate(plate_path, target)
+            handled = True
         if handled:
             ev.acceptProposedAction()
 
-    def add_folder_section(self, path: Path):
+    def add_folder_section(self, path: Path) -> "FolderSection | None":
+        """The section for this folder — made now, or the one already shown.
+        None (with a status message) for a folder without TIFFs."""
         key = str(path.resolve())
         if key in self.folder_sections:
-            return
+            return self.folder_sections[key]
         section = FolderSection(path, self)
         if not section.checks:
             self.statusBar().showMessage(f"No TIFF files in {path.name}", 4000)
             section.deleteLater()
-            return
+            return None
         self.folder_sections[key] = section
         self.folder_layout.addWidget(section, 1)
         self.adjustSize()
+        return section
 
     def remove_folder_section(self, section: FolderSection):
         from PySide6.QtCore import QTimer
@@ -412,6 +769,63 @@ class ControlWindow(FileDropMixin, QMainWindow):
         section.deleteLater()
         # Shrink after the layout has processed the removal.
         QTimer.singleShot(0, self.adjustSize)
+
+    # ---- plate layouts -------------------------------------------------
+
+    def _section_at(self, point) -> FolderSection | None:
+        w = self.childAt(point)
+        while w is not None and not isinstance(w, FolderSection):
+            w = w.parentWidget()
+        return w
+
+    def _section_for_plate(self, path: Path) -> FolderSection | None:
+        """Where a plate goes when the drop didn't say: the only section,
+        else the folder it was last used with, else one the user picks
+        (which may be a section already)."""
+        sections = list(self.folder_sections.values())
+        if len(sections) == 1:
+            return sections[0]
+        remembered = _remembered_folder(path)
+        if remembered is not None and remembered.is_dir():
+            return self.add_folder_section(remembered)
+        directory = QFileDialog.getExistingDirectory(
+            self, f"Folder of stacks for {path.name}", app_settings.last_dir()
+        )
+        if not directory:
+            return None
+        app_settings.set_last_dir(directory)
+        return self.add_folder_section(Path(directory))
+
+    def open_plate(self, path: Path, section: FolderSection | None = None):
+        """Attach a pLayout .plate file to a folder section (File > Open Plate
+        Layout…, a drop, Finder): its wells then open the folder's stacks."""
+        path = Path(path)
+        if section is None:
+            section = self._section_for_plate(path)
+            if section is None:
+                return
+        try:
+            panel = section.attach_plate(path)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Cannot read plate layout", str(exc))
+            return
+        self.adjustSize()
+        self.statusBar().showMessage(
+            f"{path.name}: {panel.matched()} of {panel.plate.n_wells} wells have a stack"
+            f" in {section.path.name}",
+            6000,
+        )
+
+    def open_plate_dialog(self, section: FolderSection | None = None):
+        """File > Open Plate Layout…, or a section's own "Plate layout…"
+        button — then the plate goes to that section, no folder question."""
+        title = "Open plate layout" if section is None else f"Plate layout for {section.path.name}"
+        path, _ = QFileDialog.getOpenFileName(
+            self, title, app_settings.last_dir(), "pLayout plate (*.plate);;All files (*)"
+        )
+        if path:
+            app_settings.set_last_dir(str(Path(path).parent))
+            self.open_plate(Path(path), section)
 
     def _save(self):
         if pane := self._pane():

@@ -308,6 +308,10 @@ class StackPane(QWidget):
         self._drag_start: QPoint | None = None
         self._tiled = False
         self._minimal = False
+        self._active_style: bool | None = None
+        # > 0 while the workspace rearranges the grid: sizes passed through
+        # on the way must not trigger renders (see _maybe_restride).
+        self._hold_restride = 0
         # Insertion indicator shown while another tile is dragged over this one.
         self._drop_indicator = QWidget(self)
         self._drop_indicator.setStyleSheet("background: #2f6fd0; border-radius: 2px;")
@@ -452,12 +456,21 @@ class StackPane(QWidget):
         self.view.scene().sigMouseMoved.connect(self._on_mouse_moved)
         self.view.viewport().installEventFilter(self)
 
-        self._last_stride = 1
+        self._last_stride = None  # nothing rendered for the screen yet
         self._clamping_zoom = False
         from .preload import maybe_preload
 
         maybe_preload(stack)
-        self.refresh()
+        # A low-resolution preview — a couple of milliseconds even for a
+        # large plane — so the pane never shows black. The plane at the
+        # stride its on-screen size calls for is rendered on first show,
+        # off the UI thread (and the preview simply stays when that is the
+        # same stride, as in a big grid): opening or splitting 48 stacks no
+        # longer renders 48 full-resolution planes serially on the main
+        # thread.
+        t, z, _c = self.position()
+        self._apply_rgb(self._cached_render(t, z, self._preview_stride()))
+        self._update_header()
         self.viewbox.autoRange(padding=0)
         self.viewbox.sigRangeChanged.connect(self._enforce_min_zoom)
         self.viewbox.sigRangeChanged.connect(self._maybe_restride)
@@ -644,6 +657,9 @@ class StackPane(QWidget):
             self.bc_dock = None
 
     def set_active_style(self, active: bool):
+        if self._active_style == active:
+            return  # a stylesheet change repolishes the label; skip no-ops
+        self._active_style = active
         style = "font-weight: bold;"
         if active:
             style += " color: palette(highlight);"
@@ -771,7 +787,9 @@ class StackPane(QWidget):
         self.refresh(async_render=True)
 
     def showEvent(self, ev):
-        if self._needs_refresh:
+        if self._last_stride is None or self._needs_refresh:
+            # First appearance, or a position that moved while the tile was
+            # hidden (soloed away / filtered): render for the size it has.
             self._needs_refresh = False
             self.refresh(async_render=True)
         super().showEvent(ev)
@@ -783,7 +801,10 @@ class StackPane(QWidget):
         # snap the tile to the shared position: it stays where it was.
         self.lock_button.setChecked(False)
         self.set_bars_visible(True)
-        self.refresh()
+        if self.isVisible():
+            self.refresh(async_render=True)  # 48 tiles leave shared axes at once
+        else:
+            self._needs_refresh = True  # a tile on its way to a window: on show
 
     def _sync_shared(self):
         """Apply the shared position; mark blank where this stack has no image
@@ -902,9 +923,22 @@ class StackPane(QWidget):
             stride *= 2
         return stride
 
+    def _preview_stride(self) -> int:
+        """The stride of the quick preview a new pane starts with: at most
+        ~256 px on the long side, as far as the stride limit allows."""
+        stride = 1
+        while max(self.stack.shape_yx) // stride > 256 and stride < 8:
+            stride *= 2
+        return stride
+
     def _maybe_restride(self, *_):
+        if self._hold_restride or not self.isVisible():
+            return  # a size on the way through a relayout, or a hidden tile
         if self._render_stride() != self._last_stride:
-            self.refresh()
+            # Off the UI thread: the plane on screen stays, scaled, until
+            # the one at the new stride lands — so neither a window resize
+            # nor a relayout of 48 tiles renders on the main thread.
+            self.refresh(async_render=True)
 
     def _enforce_min_zoom(self, *_):
         """Zooming out stops at fit-to-view: a smaller-than-view image snaps
@@ -950,7 +984,10 @@ class StackPane(QWidget):
 
     def _apply_rgb(self, rgb: np.ndarray):
         h, w = self.stack.shape_yx
-        self.image_item.setImage(rgb, autoLevels=False, levels=(0, 255))
+        # No levels: the plane is already display RGB, and pyqtgraph turns a
+        # uint8 RGB array without levels straight into a QImage, where
+        # levels=(0, 255) made it rescale every pixel on every paint.
+        self.image_item.setImage(rgb, autoLevels=False)
         # Keep the item spanning full image coordinates regardless of stride.
         self.image_item.setRect(QRectF(0, 0, w, h))
 
@@ -996,10 +1033,13 @@ class StackPane(QWidget):
         self._sync_shared()
         t, z, c = self.position()
         stride = self._render_stride()
-        self._last_stride = stride
         if self._blank:
+            self._last_stride = stride
             self._apply_rgb(np.zeros((2, 2, 3), dtype=np.uint8))
+        elif self._last_stride is None and not self.isVisible():
+            pass  # not on screen yet: showEvent renders for the size it gets
         else:
+            self._last_stride = stride
             key = self._render_key(t, z, stride)
             rgb = self._plane_cache.get(key)
             if rgb is not None:
@@ -1949,6 +1989,13 @@ def build_menus(window: QMainWindow, active_pane: Callable[[], StackPane | None]
     file_menu = window.menuBar().addMenu("&File")
     _add(file_menu, "&Open...", QKeySequence.Open, lambda: open_stack_dialog(window))
     _add(file_menu, "Open &Folder...", "Ctrl+Shift+O", lambda: open_folder(window))
+
+    def open_plate_layout():
+        from .control_panel import get_control_window
+
+        get_control_window().open_plate_dialog()
+
+    _add(file_menu, "Open &Plate Layout...", "", open_plate_layout)
     _add(file_menu, "&Save As...", QKeySequence.Save, _with_pane(StackPane.save_as))
     file_menu.addSeparator()
 
@@ -2142,12 +2189,21 @@ class StackWindow(QMainWindow):
         self.setCentralWidget(pane)
         pane.show()  # clear any explicit hide from grid solo/flag filtering
         self.setWindowTitle(pane.stack.name)
-        build_menus(self, lambda: self.pane)
+        # The menu bar is built on the window's first activation: a native
+        # one costs ~10 ms, which a split into 48 windows paid up front for
+        # 47 windows nobody had clicked yet.
+        self._menus_built = False
         self._size_to_image()
         if pane.saved_window_geometry is not None:
             self.restoreGeometry(pane.saved_window_geometry)
         pane.setFocus()
         _open_windows.add(self)
+
+    def event(self, ev):
+        if ev.type() == QEvent.Type.WindowActivate and not self._menus_built:
+            self._menus_built = True
+            build_menus(self, lambda: self.pane)
+        return super().event(ev)
 
     def detach_pane(self) -> StackPane:
         """Remove the pane so it survives this window's close (for combining)."""
@@ -2361,6 +2417,17 @@ def open_path(path: str | Path, parent: QWidget | None = None) -> StackPane | No
     return None
 
 
+def show_in_windows(panes: list[StackPane]):
+    """A floating window per pane, only the last one activated: on macOS
+    every activation swaps the native menu bar and runs the focus-change
+    refreshes, so a split of 48 stacks used to activate 48 windows in a row."""
+    for i, pane in enumerate(panes):
+        window = StackWindow(pane)
+        window.setAttribute(Qt.WA_ShowWithoutActivating, i < len(panes) - 1)
+        window.show()
+        window.setAttribute(Qt.WA_ShowWithoutActivating, False)
+
+
 def open_paths(paths, parent: QWidget | None = None) -> list[StackPane]:
     """Open many stacks at once.
 
@@ -2370,7 +2437,7 @@ def open_paths(paths, parent: QWidget | None = None) -> list[StackPane]:
     background one by one, and failures are reported once at the end instead
     of one dialog per file.
     """
-    from .workspace import get_workspace, show_stack, workspace_active
+    from .workspace import get_workspace, workspace_active
 
     stacks, deferred, failed = [], [], []
     for path in paths:
@@ -2382,13 +2449,13 @@ def open_paths(paths, parent: QWidget | None = None) -> list[StackPane]:
                 stacks.append(load_stack(path))
         except Exception as exc:  # noqa: BLE001 - collect, report once
             failed.append(f"{path.name}: {exc}")
-    if workspace_active() and stacks:
-        panes = [StackPane(stack) for stack in stacks]
+    panes = [StackPane(stack) for stack in stacks]
+    if workspace_active() and panes:
         ws = get_workspace()
         ws.add_panes(panes)
         ws.raise_()
     else:
-        panes = [show_stack(stack) for stack in stacks]
+        show_in_windows(panes)
     for path in deferred:
         open_path(path, parent)
     if failed:
@@ -2478,6 +2545,9 @@ solo) · the <b>★ only</b> box shows just the flagged tiles · <b>Sort</b>
 reorders tiles by name or brightness · <b>🔓</b> locks a tile out of shared
 axes · <b>▶</b> on z/t bars plays (right-click it for speed) · the
 <b>B&amp;C</b> button on a tile attaches a contrast panel to its side.</p>
+<p>Folder lists (drop a folder on the control window): click a file to open
+or close it · <b>drag across files</b>, or <b>Shift+click</b> after a plain
+click, to open or close a whole range at once.</p>
 """
 
 

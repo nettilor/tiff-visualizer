@@ -52,10 +52,10 @@ automatically** in Settings turns the daily look off. That check is the only
 network request the app ever makes.
 
 For the check to find a build, a release needs a downloadable asset whose name
-says which platform it is for — `TIFF-Visualizer-1.6.0-macos.dmg` (what
-`packaging/make_dmg.sh` writes) and `TIFF-Visualizer-1.6.0-windows.zip`. A
+says which platform it is for — `TIFF-Visualizer-1.7.0-macos.dmg` (what
+`packaging/make_dmg.sh` writes) and `TIFF-Visualizer-1.7.0-windows.zip`. A
 release with no matching asset still gets offered; the alert then just opens
-the release page. Tags must be plain `v1.6.0`-style versions: anything else is
+the release page. Tags must be plain `v1.7.0`-style versions: anything else is
 deliberately never offered (`tiff_visualizer/updater.py`).
 
 ## Setup
@@ -82,9 +82,56 @@ near-black chrome — chosen for microscopy work (`tiff_visualizer/theme.py`).
 Drop a **folder** onto the control window and it expands with a section: the
 folder's name (📁, ✕ to remove the section) and a checkbox per TIFF inside.
 **Checking opens the stack, unchecking closes it** — a fast way to swap
-between files. **Open all** / **Close all** under the list do the whole folder
-in one batch. Checkboxes track reality (stacks closed elsewhere untick),
-multiple folders can be dropped, and long lists scroll.
+between files; a click anywhere on the row counts. **Drag across rows**, or
+**Shift+click** a row after a plain click, and the whole range opens (or
+closes) at once as one batch — the boxes preview the range while the button
+is down, and a drag held past the list's edge scrolls it. **Open all** /
+**Close all** under the list do the whole folder in one batch. Checkboxes
+track reality (stacks closed elsewhere untick), multiple folders can be
+dropped, and long lists scroll.
+
+## Control window — plate layouts (pLayout)
+
+Drop a **`.plate` file** from [pLayout](https://github.com/nettilor/pLayout)
+onto the control window (or File → Open Plate Layout…) and the folder
+section turns into the plate: every well coloured by one of the layout's
+factors, and a click on a well opens — or closes — the stack imaged there.
+Nothing to export or set up on pLayout's side: a `.plate` is plain JSON, and
+pLayout's XY Position Fill numbers wells the way the Keyence names its
+imaging positions (`XY01`, `XY02`, …), which is how the stacks are named
+(`XY05.tif`). Wells match files by that number (`XY5` and `XY05` agree;
+several files on one position belong to the well together); a layout
+without an XY factor falls back to a well label in the file name (`B02.tif`).
+In a layout with several plates, a file that names its plate (`p2_XY01.tif`
+for a plate called `p2`, or `plate2_…`) counts only for that plate, so two
+plates that both number their wells XY01… stay apart.
+
+- **Plate layout…** under a folder's list picks a `.plate` file for that
+  folder; the **✕** on the plate's own row unlinks it again (the file list
+  comes back, open stacks stay open). A plate dropped together with a
+  folder, or onto a folder section, attaches to it; otherwise it goes to the
+  only open section, the folder it was last used with, or one you pick.
+  Dropping the folder again brings its plate back, and opening the `.plate`
+  from Finder brings the folder — until the pair is unlinked with ✕.
+- **Colour** picks the factor shown in the wells, or **Replicates**: wells
+  with the same values for the **Group by** factors share a colour and show
+  those values, one line per factor, as long as the wells are big enough to
+  read them — in a narrow window they show their group number instead — and
+  one click opens every stack of that group. **Cmd+click** (Ctrl+click on
+  Windows, Alt+click too) takes just the one well. Group by starts with
+  every factor except the XY position (which would make each well its own
+  group) and any factor hidden in pLayout's Overview; tick or untick factors
+  in its menu to decide what counts as a replicate. Wells are squares, like
+  pLayout's, so the labels get the whole cell.
+- A press-and-drag covers a rectangle of wells, like a drag down the file
+  list; opening wins while anything in it is still closed. Hollow wells have
+  no stack in the folder, a white ring marks open ones.
+- Resting the mouse on a well shows its label, every factor's value,
+  pLayout's well note and the matched file(s); open stacks carry the same
+  conditions as a tooltip on their header line.
+- **☰ / ⊞** in the section header flips between the plate and the plain file
+  list; both drive the same stacks. A layout with several plates gets a plate
+  picker.
 
 ## Control window
 
@@ -189,8 +236,8 @@ Panes are moved, never rebuilt: position, zoom and contrast survive every
 combine/split, and each floating window's position and size are remembered,
 so splitting puts every stack back exactly where its window was. Stacks opened
 while the workspace is up (files or projections) join the grid; otherwise they
-get their own window. Closing the workspace window just splits everything back
-out — it never discards stacks.
+get their own window. Closing the workspace window closes the stacks in it,
+like closing any stack window; Cmd+G is the way to split them back out.
 
 ### MIP all
 
@@ -311,7 +358,7 @@ Cmd+= / Cmd+- zoom, Cmd+1 actual size (1 image px = 1 screen px), Cmd+0 fit.
 ## Testing
 
 `QT_QPA_PLATFORM=offscreen .venv/bin/python -u tests/regression.py` runs the
-full regression suite (89 checks over the whole feature matrix, using
+full regression suite (90 checks over the whole feature matrix, using
 example_stacks/). Run it before releases and after risky changes.
 
 `example_stacks/` is 9 GB of local microscopy data and is not in the repo —

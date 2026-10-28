@@ -43,10 +43,10 @@ app = BUNDLE(
     name="TIFF Visualizer.app",
     icon=os.path.join(SPECPATH, "icon.icns"),
     bundle_identifier="com.swartzlab.tiffvisualizer",
-    version="1.6.0",
+    version="1.7.0",
     info_plist={
         "NSHighResolutionCapable": True,
-        "CFBundleShortVersionString": "1.6.0",
+        "CFBundleShortVersionString": "1.7.0",
         "CFBundleDocumentTypes": [
             {
                 "CFBundleTypeName": "TIFF image",
@@ -54,6 +54,25 @@ app = BUNDLE(
                 "LSHandlerRank": "Alternate",
                 "LSItemContentTypes": ["public.tiff"],
                 "CFBundleTypeExtensions": ["tif", "tiff"],
+            },
+            {
+                # pLayout's plate layouts: dropped on the Dock icon or opened
+                # from Finder, they attach to a folder section.
+                "CFBundleTypeName": "Plate Layout",
+                "CFBundleTypeRole": "Viewer",
+                "LSHandlerRank": "Alternate",
+                "LSItemContentTypes": ["com.nettilor.playout"],
+                "CFBundleTypeExtensions": ["plate"],
+            },
+        ],
+        # The same declaration pLayout exports, so .plate files resolve to
+        # this type whether or not pLayout is installed.
+        "UTImportedTypeDeclarations": [
+            {
+                "UTTypeIdentifier": "com.nettilor.playout",
+                "UTTypeDescription": "Plate Layout",
+                "UTTypeConformsTo": ["public.data", "public.content"],
+                "UTTypeTagSpecification": {"public.filename-extension": ["plate"]},
             }
         ],
     },
