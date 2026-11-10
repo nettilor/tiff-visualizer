@@ -47,6 +47,7 @@ def capture() -> dict:
             "locked": pane.shared_locked,
             "flagged": pane.flagged,
             "roi": pane.selection.to_json(),
+            "mask": pane.mask_layer.to_json(),
             "in_grid": ws_active and pane in ws.panes,
         }
         window = next((w for w in viewer._open_windows if w.pane is pane), None)
@@ -122,6 +123,7 @@ def restore(data: dict, parent=None):
         if entry.get("flagged"):
             pane.set_flagged(True)
         pane.selection.from_json(entry.get("roi"))
+        pane.mask_layer.from_json(entry.get("mask"))
         if "geometry" in entry:
             pane.saved_window_geometry = _geometry_from_str(entry["geometry"])
         if entry.get("in_grid"):

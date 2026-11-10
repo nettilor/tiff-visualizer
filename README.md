@@ -52,10 +52,10 @@ automatically** in Settings turns the daily look off. That check is the only
 network request the app ever makes.
 
 For the check to find a build, a release needs a downloadable asset whose name
-says which platform it is for — `TIFF-Visualizer-1.7.1-macos.dmg` (what
-`packaging/make_dmg.sh` writes) and `TIFF-Visualizer-1.7.1-windows.zip`. A
+says which platform it is for — `TIFF-Visualizer-1.8.0-macos.dmg` (what
+`packaging/make_dmg.sh` writes) and `TIFF-Visualizer-1.8.0-windows.zip`. A
 release with no matching asset still gets offered; the alert then just opens
-the release page. Tags must be plain `v1.7.1`-style versions: anything else is
+the release page. Tags must be plain `v1.8.0`-style versions: anything else is
 deliberately never offered (`tiff_visualizer/updater.py`).
 
 ## Setup
@@ -300,7 +300,8 @@ Min/Max spinboxes, **Auto** (Fiji-style 0.35% clip), **Reset** (full range),
 and **Apply to all** (this channel's min/max to the same channel of every open
 stack). The region and spinboxes are clamped to the image's value bounds
 (e.g. 0–255 for 8-bit). **Cmd+Z** undoes contrast changes — slider drags count
-as one step, and a single undo reverts a whole Apply to all.
+as one step, and a single undo reverts a whole Apply to all. (The key is
+shared with mask edits, see Masks below: whichever edit came last goes first.)
 Adjusted ranges are saved into the file's ImageJ display ranges, so Fiji shows
 the same contrast.
 
@@ -323,8 +324,9 @@ measure, scrub, measure keeps flowing.
 ### Selections — Fiji's rectangle, oval, polygon and freehand tools
 
 One app-wide **tool** — the row of buttons in the control window, Analyze →
-Selection Tool, or the keys **H / R / E / P / D** — decides what a left drag
-on an image does: the **Hand** pans, the shape tools draw. **Rectangle** and
+Tool, or the keys **H / R / E / P / D** — decides what a left drag
+on an image does: the **Hand** pans, the shape tools draw (and the mask
+tools paint, see Masks below). **Rectangle** and
 **Ellipse** drag out a box (whole pixels, clipped to the image), **Freehand**
 traces an outline, **Polygon** takes a click per corner and closes on a
 double-click or a click on the first corner. Each stack keeps one selection
@@ -336,6 +338,46 @@ right-click → Remove ROI; **Cmd+A** selects the whole image. Selections stay
 put while scrubbing z/t and switching channels, so Cmd+M can walk one region
 through a timelapse or across channels, and they are saved in sessions.
 Whole-image and selection rows sit side by side in the same table.
+
+## Masks — brush and eraser
+
+Paint a region of the image by hand — debris to leave out of an analysis, an
+area to keep — and export it as a black/white mask image. Two more tools sit
+next to the selection tools, in their own row of the control window, under
+Analyze → Tool, and on the keys **B** and **X**:
+
+- **Brush (B)**: a left drag paints a round stroke, a click one dab.
+  **Alt/Option+drag erases** for that stroke, like Fiji's brush selection tool.
+- **Eraser (X)**: the same strokes take the mask away.
+- The **size** is the brush's diameter in image pixels — the box next to the
+  two buttons, or **[** and **]** (about 15 % a step; a 1 px brush paints
+  single pixels). The brush's outline follows the mouse.
+
+The mask is a translucent magenta overlay. Each stack has one, and it belongs
+to the image rather than to a position: it stays put while scrubbing z/t and
+switching channels, and the status line counts it (`mask 3,214 px (0.47%)`).
+A stroke paints across a selection without moving or resizing it; the hand
+still pans, and so does a drag that starts outside the image.
+
+**Analyze → Mask** — also the **Mask** button in the control window:
+
+- **Add Selection to Mask** (Cmd+K) and **Subtract Selection from Mask**
+  (Cmd+Shift+K) fill, or cut out, the rectangle, ellipse, polygon or freehand
+  selection — the same pixels Cmd+M measures.
+- **Clear Mask** empties it.
+- **Export Mask…** writes a black/white image exactly the frame's size, white
+  (255) = masked and black (0) = clear: an 8-bit PNG, or a TIFF when the name
+  ends in `.tif`. The default name is the stack's (`XY05.tif` → `XY05.png`),
+  and masks remember their own folder, apart from the one stacks open from.
+- **Open Mask…** loads a mask image back onto the stack to keep editing it: a
+  PNG or TIFF of the frame's size, where every pixel brighter than half the
+  value range (in any colour channel, alpha ignored) counts as masked. A file
+  of another size is refused.
+
+**Cmd+Z** takes mask edits back one at a time — a stroke, a dab, a selection
+added or cut out, Clear and Open Mask are one step each — and shares the key
+with contrast changes: the latest edit of either kind goes first. Masks are
+saved in sessions. Exported views (PNG, GIF, montages) do not show the mask.
 
 ## Projections — Cmd+Shift+P
 
@@ -358,7 +400,7 @@ Cmd+= / Cmd+- zoom, Cmd+1 actual size (1 image px = 1 screen px), Cmd+0 fit.
 ## Testing
 
 `QT_QPA_PLATFORM=offscreen .venv/bin/python -u tests/regression.py` runs the
-full regression suite (90 checks over the whole feature matrix, using
+full regression suite (101 checks over the whole feature matrix, using
 example_stacks/). Run it before releases and after risky changes.
 
 `example_stacks/` is 9 GB of local microscopy data and is not in the repo —
@@ -387,6 +429,10 @@ names.
 - `tiff_visualizer/roi.py` — the selection tools (rectangle, ellipse,
   polygon, freehand): the app-wide tool state, the pyqtgraph ROI items, the
   drawing interaction on a pane's ViewBox, and the pixel masks Cmd+M measures.
+- `tiff_visualizer/mask.py` — the mask layer (brush and eraser): one binary
+  mask per pane, its overlay item (which is also the surface the brush paints
+  on, above the selection), the stroke geometry, undo (shared with contrast
+  changes through `viewer.undo`), and reading / writing mask images.
 - `tiff_visualizer/updater.py` — the GitHub release check, its download, and
   the policy (version comparison, once-a-day, skipped versions) kept in pure
   functions the regression suite exercises without a network.

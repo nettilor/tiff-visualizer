@@ -386,9 +386,12 @@ class StackPane(QWidget):
         self.view.setFocusProxy(self)  # clicks on the image focus/activate the pane
         self.image_item = pg.ImageItem()
         self.viewbox.addItem(self.image_item)
+        from .mask import MaskLayer
         from .roi import Selection
 
         self.selection = Selection(self)
+        # Not "mask": that is QWidget's own (the widget's clip region).
+        self.mask_layer = MaskLayer(self)
         self._middle.addWidget(self.view, 1)
         layout.addLayout(self._middle, 1)
 
@@ -678,6 +681,7 @@ class StackPane(QWidget):
     def unregister(self):
         global _active_pane
         self.selection.detach()
+        self.mask_layer.detach()
         if self in _all_panes:
             _all_panes.remove(self)
         if _active_pane is self:
@@ -1139,16 +1143,18 @@ class StackPane(QWidget):
     def eventFilter(self, obj, ev):
         if ev.type() == QEvent.Leave and obj is self.view.viewport():
             self._probe_pos = None  # cursor gone: nothing to re-read on plane changes
+            self.mask_layer.cursor_left()
         return super().eventFilter(obj, ev)
 
     def _on_mouse_moved(self, scene_pos):
         # Kept so refresh() can re-read the value when the plane changes
         # under a cursor that doesn't move.
         self._probe_pos = scene_pos
+        pos = self.viewbox.mapSceneToView(scene_pos)
+        self.mask_layer.mouse_moved(pos)  # the brush's outline, with a mask tool
         if self._blank:
             self.set_probe("")
             return
-        pos = self.viewbox.mapSceneToView(scene_pos)
         if self.selection.drawing():
             self.selection.mouse_moved(pos)  # writes its own status line
             return
@@ -1162,7 +1168,8 @@ class StackPane(QWidget):
                 val = " ".join(fmt(v) for v in values)
             else:
                 val = fmt(values[c])
-            self.set_probe(f"x={x} y={y}  value: {val}")
+            mask = self.mask_layer.status()  # "mask 3,214 px (0.47%)" once there is one
+            self.set_probe(f"x={x} y={y}  value: {val}" + (f"  ·  {mask}" if mask else ""))
         else:
             self.set_probe("")
 
@@ -1242,6 +1249,101 @@ class StackPane(QWidget):
         measure.record(m)
         if isinstance(host, QMainWindow):
             host.statusBar().showMessage(f"Measured {m.stack} ({m.where()}): {m.summary()}", 5000)
+
+    # ---- mask (painted with the brush and eraser tools, see mask.py) ----
+
+    def mask_from_selection(self, subtract: bool = False):
+        """Add the selection to the mask, or cut it out of the mask."""
+        region = self.selection.mask()
+        if region is None:
+            _show_status("No selection: draw one with a shape tool first", 4000, self)
+            return
+        layer = self.mask_layer
+        if layer.add_region(region, subtract):
+            verb = "cut out of" if subtract else "added to"
+            _show_status(f"Selection {verb} the mask: {layer.status() or 'the mask is empty'}", 5000, self)
+        else:
+            state = "has nothing in that region" if subtract else "covers that region"
+            _show_status(f"The mask already {state}", 4000, self)
+
+    def clear_mask(self):
+        if self.mask_layer.clear():
+            _show_status("Mask cleared (Cmd+Z brings it back)", 4000, self)
+        else:
+            _show_status("No mask to clear", 3000, self)
+
+    def _mask_start_dir(self) -> Path:
+        """Where the mask dialogs open: the folder masks last went to or
+        came from, else next to the stack."""
+        from . import mask
+
+        saved = mask.last_dir()
+        if saved and Path(saved).is_dir():
+            return Path(saved)
+        if self.stack.path is not None:
+            return self.stack.path.parent
+        return Path(app_settings.last_dir() or Path.home())
+
+    def export_mask(self):
+        """Write the mask as a black/white image of the frame's size, white
+        = masked, named after the stack (XY05.tif -> XY05.png)."""
+        from . import mask
+
+        layer = self.mask_layer
+        if layer.is_empty():
+            _show_status("No mask to export: paint one with the brush (B) first", 5000, self)
+            return
+        start = self._mask_start_dir() / f"{Path(self.stack.name).stem}.png"
+        path, _ = QFileDialog.getSaveFileName(self, "Export mask", str(start), mask.SAVE_FILTER)
+        if not path:
+            return
+        if Path(path).suffix.lower() not in mask.SUFFIXES:
+            path += ".png"
+        try:
+            mask.write_mask(path, layer.data)
+        except (OSError, ValueError) as exc:
+            _export_failed(self, path, exc)
+            return
+        mask.set_last_dir(str(Path(path).parent))
+        h, w = self.stack.shape_yx
+        _show_status(f"Exported mask to {path} ({w}×{h}, {layer.count:,} px masked)", 6000, self)
+
+    def open_mask(self):
+        from . import mask
+
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open mask", str(self._mask_start_dir()), mask.OPEN_FILTER
+        )
+        if path:
+            mask.set_last_dir(str(Path(path).parent))
+            self.load_mask(path)
+
+    def load_mask(self, path) -> bool:
+        """Replace the mask with a mask image (bright = masked) of the
+        frame's size; one undo step. False, after a dialog saying why, when
+        the file cannot be used."""
+        from . import mask
+
+        path = Path(path)
+        try:
+            array = mask.read_mask(path)
+        except ValueError as exc:
+            QMessageBox.critical(self, "Cannot open mask", f"{path}\n\n{exc}")
+            return False
+        h, w = self.stack.shape_yx
+        if array.shape != (h, w):
+            QMessageBox.critical(
+                self,
+                "Cannot open mask",
+                f"{path.name} is {array.shape[1]}×{array.shape[0]} px, but {self.stack.name} is "
+                f"{w}×{h} px.\n\nA mask has to be the size of the image it belongs to.",
+            )
+            return False
+        self.mask_layer.set_array(array)
+        _show_status(
+            f"Opened mask {path.name}: {self.mask_layer.status() or 'nothing masked'}", 5000, self
+        )
+        return True
 
     # ---- actions (invoked from menus of whichever window hosts us) -----
 
@@ -1968,6 +2070,68 @@ class ExportMovieDialog(QDialog):
         return axis, self.fps_spin.value(), rng.values() if rng else None
 
 
+def undo():
+    """Cmd+Z: take back whichever came last — a mask edit (a stroke, a
+    selection added or cut out, Clear, Open Mask) or a contrast change."""
+    from . import bc_panel, mask
+
+    masked, contrast = mask.last_edit_time(), bc_panel.last_undo_time()
+    if masked is not None and (contrast is None or masked >= contrast):
+        layer = mask.undo_last()
+        if layer is not None:
+            _show_status(
+                f"Undid the mask edit on {layer.pane.stack.name}: "
+                f"{layer.status() or 'no mask left'}",
+                4000,
+                layer.pane,
+            )
+    else:
+        bc_panel.undo_last_range_change()
+
+
+def add_mask_actions(
+    menu: QMenu,
+    owner: QWidget,
+    active_pane: Callable[[], "StackPane | None"],
+    shortcuts: bool = True,
+):
+    """Fill a menu with the mask commands: Analyze > Mask in every menu bar,
+    and the control window's Mask button — which passes shortcuts=False,
+    since its window's menu bar already holds them and a shortcut bound
+    twice in one window fires neither."""
+    from . import mask
+
+    def add(text, shortcut, slot) -> QAction:
+        action = QAction(text, owner)
+        if shortcuts and shortcut:
+            action.setShortcut(QKeySequence(shortcut))
+        action.triggered.connect(slot)
+        menu.addAction(action)
+        return action
+
+    def with_pane(method):
+        def run():
+            pane = active_pane()
+            if pane is not None:
+                method(pane)
+
+        return run
+
+    add("&Add Selection to Mask", "Ctrl+K", with_pane(lambda p: p.mask_from_selection()))
+    add(
+        "&Subtract Selection from Mask",
+        "Ctrl+Shift+K",
+        with_pane(lambda p: p.mask_from_selection(subtract=True)),
+    )
+    add("&Clear Mask", "", with_pane(StackPane.clear_mask))
+    menu.addSeparator()
+    add("&Larger Brush", "]", lambda: mask.step_brush_size(1))
+    add("S&maller Brush", "[", lambda: mask.step_brush_size(-1))
+    menu.addSeparator()
+    add("&Open Mask...", "", with_pane(StackPane.open_mask))
+    add("&Export Mask...", "", with_pane(StackPane.export_mask))
+
+
 def build_menus(window: QMainWindow, active_pane: Callable[[], StackPane | None]):
     """Shared menu bar for stack windows and the workspace window."""
 
@@ -2040,13 +2204,7 @@ def build_menus(window: QMainWindow, active_pane: Callable[[], StackPane | None]
         show_bc_panel(pane)
 
     _add(image_menu, "&Brightness/Contrast...", "Ctrl+Shift+C", _with_pane(show_bc))
-
-    def undo_contrast():
-        from .bc_panel import undo_last_range_change
-
-        undo_last_range_change()
-
-    _add(image_menu, "&Undo Contrast Change", QKeySequence.Undo, undo_contrast)
+    _add(image_menu, "&Undo Contrast / Mask Edit", QKeySequence.Undo, undo)
     _add(image_menu, "&Projection...", "Ctrl+Shift+P", _with_pane(StackPane.project))
     image_menu.addSeparator()
     _add(image_menu, "&Copy View", QKeySequence.Copy, _with_pane(StackPane.copy_view))
@@ -2087,10 +2245,12 @@ def build_menus(window: QMainWindow, active_pane: Callable[[], StackPane | None]
 
     from . import roi
 
-    tool_menu = analyze_menu.addMenu("Selection &Tool")
+    tool_menu = analyze_menu.addMenu("&Tool")
     tool_group = QActionGroup(window)
     tool_group.setExclusive(True)
     for name in roi.TOOLS:
+        if name == roi.MASK_TOOLS[0]:
+            tool_menu.addSeparator()  # hand + selection tools | mask tools
         action = _add(
             tool_menu,
             f"{roi.TOOL_LABELS[name]} Tool",
@@ -2119,6 +2279,8 @@ def build_menus(window: QMainWindow, active_pane: Callable[[], StackPane | None]
     window.destroyed.connect(release_tool_signal)
     _add(analyze_menu, "Select &All", QKeySequence.SelectAll, _with_pane(lambda p: p.selection.select_all()))
     _add(analyze_menu, "Select &None", "Ctrl+Shift+A", _with_pane(lambda p: p.selection.clear()))
+    analyze_menu.addSeparator()
+    add_mask_actions(analyze_menu.addMenu("Mas&k"), window, active_pane)
 
     view_menu = window.menuBar().addMenu("&View")
     _add(view_menu, "Zoom &In", QKeySequence.ZoomIn, _with_pane(lambda p: p.zoom(1 / 1.25)))
@@ -2518,7 +2680,7 @@ _CHEATSHEET = """
 <tr><td><b>pinch / Cmd+wheel</b></td><td>zoom at cursor</td>
     <td></td><td><b>Cmd+Shift+C</b></td><td>brightness / contrast</td></tr>
 <tr><td><b>Cmd+0 / Cmd+1</b></td><td>fit / actual size</td>
-    <td></td><td><b>Cmd+Z</b></td><td>undo contrast change</td></tr>
+    <td></td><td><b>Cmd+Z</b></td><td>undo contrast change / mask edit</td></tr>
 <tr><td><b>Cmd+O / Cmd+Shift+O</b></td><td>open files / folder</td>
     <td></td><td><b>Cmd+Shift+P</b></td><td>projection…</td></tr>
 <tr><td><b>Cmd+S</b></td><td>save as (ImageJ format)</td>
@@ -2534,12 +2696,18 @@ _CHEATSHEET = """
 <tr><td><b>H / R / E / P / D</b></td><td>hand / rectangle / ellipse / polygon / freehand tool</td>
     <td></td><td><b>Cmd+A / Cmd+Shift+A</b></td><td>select all / none</td></tr>
 <tr><td><b>Esc</b></td><td>abandon the shape being drawn, else clear the selection</td>
-    <td></td><td></td><td></td></tr>
+    <td></td><td><b>Cmd+K / Cmd+Shift+K</b></td><td>add the selection to the mask / cut it out</td></tr>
+<tr><td><b>B / X</b></td><td>brush / eraser tool (paint a mask)</td>
+    <td></td><td><b>[ / ]</b></td><td>smaller / larger brush</td></tr>
 </table>
 <p>Selections: with a shape tool, drag on the image to draw (polygon: click
 the corners, double-click to close); drag inside a selection to move it,
 its handles resize it; a click outside clears it. <b>Cmd+M</b> measures
 inside the selection.</p>
+<p>Masks: with the brush, drag on the image to paint (a click is one dab,
+<b>Alt/Option</b>+drag erases); the mask stays put on every channel, slice
+and frame. <b>Analyze → Mask → Export Mask…</b> writes it as a black/white
+image of the frame's size (white = masked), <b>Open Mask…</b> loads one back.</p>
 <p>Grid tiles: drag the <b>header strip</b> to rearrange (double-click it to
 solo) · the <b>★ only</b> box shows just the flagged tiles · <b>Sort</b>
 reorders tiles by name or brightness · <b>🔓</b> locks a tile out of shared

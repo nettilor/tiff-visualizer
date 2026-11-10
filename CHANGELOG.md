@@ -1,5 +1,39 @@
 # Changelog
 
+## 1.8.0 — 2026-11-10
+
+### Masks
+- **Brush and Eraser tools**: paint a region of the image by hand and export
+  it as a black/white mask — debris to leave out of an analysis, an area to
+  keep. Two more tools next to the selection tools, in their own row of the
+  control window, under Analyze → Tool (the Selection Tool menu, renamed)
+  and on the keys B and X. The brush paints a round stroke on a left drag
+  and one dab on a click; Alt/Option+drag erases for that stroke, like
+  Fiji's brush selection tool; the eraser takes the mask away. The size is
+  the diameter in image pixels — the box next to the two buttons, or [ and ]
+  (about 15 % a step, down to a 1 px brush that paints single pixels) — and
+  the brush's outline follows the mouse.
+- **One mask per stack**, a translucent magenta overlay that belongs to the
+  image rather than to a position: it stays put while scrubbing z/t and
+  switching channels, and the status line counts it (`mask 3,214 px
+  (0.47%)`). A stroke paints across a selection without moving or resizing
+  it; the hand still pans, and so does a drag that starts outside the image.
+- **Analyze → Mask**, mirrored by a Mask button in the control window: Add
+  Selection to Mask (Cmd+K) and Subtract Selection from Mask (Cmd+Shift+K)
+  fill, or cut out, the selection — the same pixels Cmd+M measures — and
+  Clear Mask empties it.
+- **Export Mask…** writes a black/white image exactly the frame's size,
+  white (255) = masked: an 8-bit PNG named after the stack (`XY05.tif` →
+  `XY05.png`), or a TIFF when the name ends in `.tif`. **Open Mask…** loads
+  a PNG or TIFF of the frame's size back to keep editing it — every pixel
+  brighter than half the value range, in any colour channel, counts as
+  masked — and refuses a file of another size. Masks remember their own
+  folder, apart from the one stacks open from.
+- **Cmd+Z undoes mask edits** — a stroke, a dab, a selection added or cut
+  out, Clear and Open Mask are one step each — and now shares the key with
+  contrast changes: the latest edit of either kind goes first, across
+  stacks. Masks are saved in sessions; exported views do not show them.
+
 ## 1.7.1 — 2026-10-28
 
 ### Plate layouts (pLayout)

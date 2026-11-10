@@ -43,10 +43,10 @@ app = BUNDLE(
     name="TIFF Visualizer.app",
     icon=os.path.join(SPECPATH, "icon.icns"),
     bundle_identifier="com.swartzlab.tiffvisualizer",
-    version="1.7.1",
+    version="1.8.0",
     info_plist={
         "NSHighResolutionCapable": True,
-        "CFBundleShortVersionString": "1.7.1",
+        "CFBundleShortVersionString": "1.8.0",
         "CFBundleDocumentTypes": [
             {
                 "CFBundleTypeName": "TIFF image",

@@ -2,10 +2,11 @@
 polygon and freehand selections, one per stack.
 
 One app-wide tool decides what a left drag on an image does: the hand pans,
-the shape tools draw. A pane keeps at most one selection: drawing a new one
-replaces it, a click outside it clears it, dragging inside moves it and the
-handles resize it (rectangle/ellipse) or move vertices (polygon). Cmd+M
-measures inside it. Selections are saved in sessions.
+the shape tools draw, the mask tools (brush and eraser, see mask.py) paint.
+A pane keeps at most one selection: drawing a new one replaces it, a click
+outside it clears it, dragging inside moves it and the handles resize it
+(rectangle/ellipse) or move vertices (polygon). Cmd+M measures inside it.
+Selections are saved in sessions.
 """
 
 from __future__ import annotations
@@ -19,21 +20,30 @@ from PySide6.QtCore import QObject, QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QImage, QPainter, QPainterPath
 from PySide6.QtWidgets import QGraphicsPathItem
 
-TOOLS = ("hand", "rect", "ellipse", "polygon", "freehand")
+SHAPE_TOOLS = ("rect", "ellipse", "polygon", "freehand")  # draw the selection
+MASK_TOOLS = ("brush", "eraser")  # paint the mask (mask.py)
+TOOLS = ("hand", *SHAPE_TOOLS, *MASK_TOOLS)
 TOOL_LABELS = {
     "hand": "Hand",
     "rect": "Rectangle",
     "ellipse": "Ellipse",
     "polygon": "Polygon",
     "freehand": "Freehand",
+    "brush": "Brush",
+    "eraser": "Eraser",
 }
-TOOL_KEYS = {"hand": "H", "rect": "R", "ellipse": "E", "polygon": "P", "freehand": "D"}
+TOOL_KEYS = {
+    "hand": "H", "rect": "R", "ellipse": "E", "polygon": "P", "freehand": "D",
+    "brush": "B", "eraser": "X",
+}
 TOOL_HINTS = {
     "hand": "Drag pans the image, selection or not",
     "rect": "Drag on the image to draw a rectangle",
     "ellipse": "Drag on the image to draw an ellipse",
     "polygon": "Click the corners; double-click or click the first corner to close",
     "freehand": "Drag on the image to trace an outline",
+    "brush": "Drag on the image to paint the mask; Alt/Option+drag erases; [ and ] resize the brush",
+    "eraser": "Drag on the image to erase the mask; [ and ] resize the eraser",
 }
 
 COLOR = "#ffd400"  # Fiji's selection yellow
@@ -188,8 +198,9 @@ class Selection:
         self.viewbox.addItem(item, ignoreBounds=True)
         item.sigRemoveRequested.connect(lambda *_: self._remove_later(item))
         # Like Fiji, only a shape tool moves a selection by dragging inside
-        # it; the hand always pans, even over a whole-image selection.
-        item.translatable = tool() != "hand"
+        # it; the hand always pans, even over a whole-image selection, and
+        # the mask tools paint across it.
+        item.translatable = tool() in SHAPE_TOOLS
         self.roi = item
 
     def _remove_later(self, item):
@@ -337,7 +348,7 @@ class Selection:
             return
         self.cancel()
         if self.roi is not None:
-            self.roi.translatable = name != "hand"
+            self.roi.translatable = name in SHAPE_TOOLS
         self.pane.view.viewport().setCursor(Qt.ArrowCursor if name == "hand" else Qt.CrossCursor)
 
     def cancel(self) -> bool:
@@ -365,7 +376,7 @@ class Selection:
         """A left drag on the image with a rectangle/ellipse/freehand tool
         draws that shape; returns False to let the ViewBox pan otherwise."""
         t = tool()
-        if t in ("hand", "polygon") or ev.button() != Qt.LeftButton:
+        if t not in ("rect", "ellipse", "freehand") or ev.button() != Qt.LeftButton:
             return False
         pos = self.viewbox.mapToView(ev.pos())
         if ev.isStart():
@@ -410,9 +421,9 @@ class Selection:
     def click(self, ev) -> bool:
         """Polygon tool: clicks add corners, a double-click or a click on the
         first corner closes. Other shape tools: a click outside the selection
-        clears it (Fiji). The hand tool leaves clicks alone."""
+        clears it (Fiji). The hand and the mask tools leave clicks alone."""
         t = tool()
-        if t == "hand" or ev.button() != Qt.LeftButton:
+        if t not in SHAPE_TOOLS or ev.button() != Qt.LeftButton:
             return False
         pos = self.viewbox.mapToView(ev.pos())
         ev.accept()

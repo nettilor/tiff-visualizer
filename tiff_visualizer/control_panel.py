@@ -24,10 +24,12 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QSpinBox,
     QStackedWidget,
     QStyle,
     QToolButton,
@@ -602,10 +604,10 @@ class ControlWindow(FileDropMixin, QMainWindow):
         button("Open…", "Open TIFF stacks (Cmd+O)", self._open, 0, 0)
         button("Open folder…", "Open all TIFF stacks in a folder (Cmd+Shift+O)", self._open_folder, 0, 1)
         self.save_button = button(
-            "Save As…", "Save active stack in ImageJ format (Cmd+S)", self._save, 6, 0
+            "Save As…", "Save active stack in ImageJ format (Cmd+S)", self._save, 7, 0
         )
-        button("Shortcuts (?)", "Show the keyboard cheatsheet", self._cheatsheet, 6, 1)
-        button("Settings…", "App settings: RAM preloading budget (Cmd+,)", self._settings, 7, 0, colspan=2)
+        button("Shortcuts (?)", "Show the keyboard cheatsheet", self._cheatsheet, 7, 1)
+        button("Settings…", "App settings: RAM preloading budget (Cmd+,)", self._settings, 8, 0, colspan=2)
         self.bc_button = button(
             "B&&C", "Brightness/Contrast panel (Cmd+Shift+C)", self._bc, 1, 0
         )
@@ -620,15 +622,25 @@ class ControlWindow(FileDropMixin, QMainWindow):
             "Shared axes", "One set of c/z/t sliders drives all tiled stacks (Cmd+Shift+G)",
             self._toggle_shared, 3, 0, colspan=2, checkable=True,
         )
-        # Selection tools (Fiji's toolbar): one app-wide tool, the menu's
-        # Analyze > Selection Tool actions and these buttons mirror each other.
-        from . import roi
+        # Tools (Fiji's toolbar): one app-wide tool, the menu's Analyze > Tool
+        # actions and these buttons mirror each other. The hand and the
+        # selection tools share a row; the mask tools get the one below,
+        # with the brush size and the mask commands.
+        from . import mask, roi
 
         tools = QHBoxLayout()
         tools.setSpacing(4)
+        mask_row = QHBoxLayout()
+        mask_row.setSpacing(4)
         self.tool_group = QButtonGroup(self)
         self.tool_group.setExclusive(True)
         self.tool_buttons: dict[str, QToolButton] = {}
+        # Fusion draws a checked tool button barely darker; make the active
+        # tool unmistakable with the accent color.
+        tool_style = (
+            "QToolButton { padding: 3px 6px; border: 1px solid #3a3a3a; border-radius: 3px; }"
+            "QToolButton:checked { background: #2f6fd0; color: white; border-color: #2f6fd0; }"
+        )
         for name in roi.TOOLS:
             b = QToolButton()
             b.setText(roi.TOOL_LABELS[name])
@@ -637,22 +649,44 @@ class ControlWindow(FileDropMixin, QMainWindow):
             b.setFocusPolicy(Qt.NoFocus)
             b.setToolTip(f"{roi.TOOL_LABELS[name]} tool ({roi.TOOL_KEYS[name]})\n{roi.TOOL_HINTS[name]}")
             b.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            # Fusion draws a checked tool button barely darker; make the
-            # active tool unmistakable with the accent color.
-            b.setStyleSheet(
-                "QToolButton { padding: 3px 6px; border: 1px solid #3a3a3a; border-radius: 3px; }"
-                "QToolButton:checked { background: #2f6fd0; color: white; border-color: #2f6fd0; }"
-            )
+            b.setStyleSheet(tool_style)
             b.clicked.connect(lambda _checked=False, n=name: roi.set_tool(n))
             self.tool_group.addButton(b)
             self.tool_buttons[name] = b
-            tools.addWidget(b)
+            (mask_row if name in roi.MASK_TOOLS else tools).addWidget(b)
         grid.addLayout(tools, 4, 0, 1, 2)
         roi.tool_changed().connect(self._on_tool_changed)
 
-        self.fit_button = button("Fit", "Fit image to window (Cmd+0)", self._fit, 5, 0)
+        self.brush_spin = QSpinBox()
+        self.brush_spin.setRange(mask.MIN_SIZE, mask.MAX_SIZE)
+        self.brush_spin.setSuffix(" px")
+        self.brush_spin.setValue(mask.brush_size())
+        self.brush_spin.setFocusPolicy(Qt.ClickFocus)  # type a size; never grabs focus by Tab
+        self.brush_spin.setToolTip("Brush and eraser diameter in image pixels ([ and ] step it)")
+        self.brush_spin.valueChanged.connect(mask.set_brush_size)
+        mask.size_changed().connect(self._on_brush_size_changed)
+        mask_row.addWidget(self.brush_spin)
+        self.mask_button = QToolButton()
+        self.mask_button.setText("Mask")
+        self.mask_button.setFocusPolicy(Qt.NoFocus)
+        self.mask_button.setToolTip(
+            "Mask of the active stack: add or cut out the selection, clear,\n"
+            "open a mask image, export the mask as a black/white image"
+        )
+        self.mask_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.mask_button.setStyleSheet(  # room on the right for the menu arrow
+            "QToolButton { padding: 3px 18px 3px 8px; border: 1px solid #3a3a3a; border-radius: 3px; }"
+            "QToolButton::menu-indicator { subcontrol-position: right center; right: 5px; }"
+        )
+        mask_menu = QMenu(self.mask_button)
+        viewer.add_mask_actions(mask_menu, self, viewer.active_pane, shortcuts=False)
+        self.mask_button.setMenu(mask_menu)
+        mask_row.addWidget(self.mask_button)
+        grid.addLayout(mask_row, 5, 0, 1, 2)
+
+        self.fit_button = button("Fit", "Fit image to window (Cmd+0)", self._fit, 6, 0)
         self.actual_button = button(
-            "100%", "Actual size, 1 image px = 1 screen px (Cmd+1)", self._actual, 5, 1
+            "100%", "Actual size, 1 image px = 1 screen px (Cmd+1)", self._actual, 6, 1
         )
 
         # Dropped-folder sections live between the buttons and the status line;
@@ -863,6 +897,12 @@ class ControlWindow(FileDropMixin, QMainWindow):
 
     def _on_tool_changed(self, name: str):
         self.tool_buttons[name].setChecked(True)
+
+    def _on_brush_size_changed(self, size: int):
+        if self.brush_spin.value() != size:  # changed with [ / ], not here
+            self.brush_spin.blockSignals(True)
+            self.brush_spin.setValue(size)
+            self.brush_spin.blockSignals(False)
 
     @contextmanager
     def bulk_update(self):

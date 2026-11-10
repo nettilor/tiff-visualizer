@@ -609,6 +609,396 @@ assert not sel.roi.translatable  # the hand pans even over a whole-image selecti
 sel.clear()
 ok("drawing tools: drag rect, click polygon, trace freehand, click outside, Esc")
 
+print("masks")
+from PySide6.QtGui import QImage, QKeySequence  # noqa: E402
+from PySide6.QtWidgets import QFileDialog, QMessageBox  # noqa: E402
+
+import tifffile  # noqa: E402
+
+from tiff_visualizer import mask as mask_mod  # noqa: E402
+
+# A stroke is geometry: the pixels whose centre lies within the brush radius
+# of the path, clipped to the image; the pixels under its ends always count.
+frame = (720, 960)
+(ys, xs), hit = mask_mod.stroke_mask(frame, (10.5, 10.5), (10.5, 10.5), 0.5)
+assert (ys, xs) == (slice(10, 11), slice(10, 11)) and hit.all()  # 1 px brush: one pixel
+(ys, xs), hit = mask_mod.stroke_mask(frame, (10.0, 10.0), (10.0, 10.0), 0.5)
+assert hit.sum() == 1 and hit[1, 1]  # on a pixel corner: still the pixel under the cursor
+(ys, xs), hit = mask_mod.stroke_mask(frame, (50.5, 50.5), (50.5, 50.5), 5)
+assert hit.sum() == 81 and (ys, xs) == (slice(45, 56), slice(45, 56))  # the digital disk of radius 5
+(ys, xs), hit = mask_mod.stroke_mask(frame, (10.5, 10.5), (30.5, 10.5), 3)
+assert hit.sum() == 169 and hit[3].all() and hit.shape == (7, 27)  # a capsule: 21×7 + the two caps
+(ys, xs), hit = mask_mod.stroke_mask(frame, (0.5, 0.5), (20.5, 13.5), 0.5)
+first = hit.argmax(axis=0)
+assert hit.any(axis=0).all() and (np.abs(np.diff(first)) <= 1).all()  # a 1 px line has no gaps
+(ys, xs), hit = mask_mod.stroke_mask(frame, (-3, -3), (2.5, 2.5), 2)
+assert (ys.start, xs.start) == (0, 0) and hit[0, 0]  # clipped at the border
+assert mask_mod.stroke_mask(frame, (-50, -50), (-40, -40), 5) is None
+assert mask_mod.stroke_mask(frame, (2000, 2000), (2010, 2010), 5) is None
+ok("mask strokes: 1 px dab, disk, capsule, gap-free thin line, clipping")
+
+# The brush and the eraser are tools like the others; the brush size is
+# app-wide, shown in the control window and stepped with [ and ].
+layer = p1.mask_layer
+assert layer.is_empty() and layer.data is None  # nothing allocated until painted
+assert not layer.paints() and layer.status() == ""
+brush_action = next(a for a in p1.window().findChildren(QAction) if a.text() == "Brush Tool")
+eraser_action = next(a for a in p1.window().findChildren(QAction) if a.text() == "Eraser Tool")
+assert brush_action.shortcut().toString() == "B" and eraser_action.shortcut().toString() == "X"
+brush_action.trigger()
+assert roi.tool() == "brush" and layer.paints() and ctrl.tool_buttons["brush"].isChecked()
+assert p1.view.viewport().cursor().shape() == Qt.CrossCursor
+# The mask tools leave the selection alone: no shape is drawn, a click clears nothing.
+sel.set_rect(10, 20, 64, 48)
+assert not sel.roi.translatable and not sel.drag(FakeMouse(vb, 5, 5, start=True))
+assert not sel.click(FakeMouse(vb, 500, 500)) and sel.roi is not None
+sel.clear()
+mask_mod.set_brush_size(40)
+assert ctrl.brush_spin.value() == 40 and app_settings.settings().value("mask/brush_size", type=int) == 40
+ctrl.brush_spin.setValue(12)
+assert mask_mod.brush_size() == 12
+larger = next(a for a in p1.window().findChildren(QAction) if a.text() == "&Larger Brush")
+smaller = next(a for a in p1.window().findChildren(QAction) if a.text() == "S&maller Brush")
+assert larger.shortcut().toString() == "]" and smaller.shortcut().toString() == "["
+larger.trigger()
+assert mask_mod.brush_size() == 14 and ctrl.brush_spin.value() == 14  # ~15 % steps
+smaller.trigger()
+smaller.trigger()
+assert mask_mod.brush_size() == 10
+mask_mod.set_brush_size(0)
+assert mask_mod.brush_size() == mask_mod.MIN_SIZE
+mask_mod.set_brush_size(10**6)
+assert mask_mod.brush_size() == mask_mod.MAX_SIZE
+mask_mod.set_brush_size(10)
+# The control window's Mask button offers the same commands, without the
+# shortcuts its own menu bar already holds.
+menu_texts = [a.text() for a in ctrl.mask_button.menu().actions() if not a.isSeparator()]
+assert menu_texts == [
+    "&Add Selection to Mask", "&Subtract Selection from Mask", "&Clear Mask",
+    "&Larger Brush", "S&maller Brush", "&Open Mask...", "&Export Mask...",
+]
+assert all(a.shortcut().isEmpty() for a in ctrl.mask_button.menu().actions())
+add_action = next(a for a in p1.window().findChildren(QAction) if a.text() == "&Add Selection to Mask")
+assert add_action.shortcut().toString() == "Ctrl+K"
+ok("mask tools: Brush (B) / Eraser (X), brush size in the control window, [ and ], Mask menu")
+
+# Painting: a drag is a stroke from the press through every position since,
+# a click one dab; the eraser, or Alt with the brush, takes pixels away.
+P = QPointF
+layer.drag(P(100.5, 100.5), P(100.5, 100.5), True, False)
+layer.drag(P(100.5, 100.5), P(150.5, 100.5), False, False)
+layer.drag(P(100.5, 100.5), P(200.5, 100.5), False, True)
+assert layer.count == 1181 and layer.data.shape == frame  # 101×11 + the two round caps
+assert layer.data[100, 100:201].all() and layer.data[95:106, 150].all()
+assert not layer.data[94, 150] and not layer.data[100, 94] and layer.data[100, 95]
+assert layer.status() == "mask 1,181 px (0.17%)"
+assert layer.item.image is not None and layer.item.boundingRect().width() == 960
+p1._on_mouse_moved(p1.viewbox.mapViewToScene(P(400, 300)))
+assert p1.probe_label.text().endswith("  ·  mask 1,181 px (0.17%)")
+assert layer._cursor.isVisible() and layer._cursor.rect().width() == 10  # the brush's outline
+assert (layer._cursor.rect().center() - P(400, 300)).manhattanLength() < 1e-6
+mask_mod.set_brush_size(30)
+assert layer._cursor.rect().width() == 30
+assert (layer._cursor.rect().center() - P(400, 300)).manhattanLength() < 1e-6
+mask_mod.set_brush_size(10)
+layer.dab(P(300.5, 300.5))
+assert layer.count == 1181 + 81
+layer.drag(P(150.5, 80.5), P(150.5, 120.5), True, True, alt=True)  # Alt + brush erases
+assert layer.count == 1181 + 81 - 11 * 11 and not layer.data[100, 150]
+roi.set_tool("eraser")
+assert layer._cursor.pen().style() == Qt.DashLine and not layer._cursor.isVisible()
+layer.dab(P(300.5, 300.5))
+assert layer.count == 1181 - 121
+layer.dab(P(-200, -200))  # off the image: nothing changes, nothing to undo
+assert layer.count == 1181 - 121 and len(layer._undo) == 4
+roi.set_tool("brush")
+layer.dab(P(0, 0))  # clipped at the corner
+corner_px = int(layer.data[:6, :6].sum())
+assert layer.data[0, 0] and 0 < corner_px < 81 and layer.count == 1181 - 121 + corner_px
+p1._blank = True
+assert not layer.paints()  # a tile with no image at this position is not painted on
+p1._blank = False
+ok("brush strokes and dabs, Alt and the eraser erase, clipped at the border, probe readout")
+
+# Cmd+Z takes mask edits back one by one, newest first.
+counts = [layer.count]
+for _ in range(5):
+    assert mask_mod.undo_last() is layer
+    counts.append(layer.count)
+assert counts == [1181 - 121 + corner_px, 1181 - 121, 1181 + 81 - 121, 1181 + 81, 1181, 0]
+assert layer.is_empty() and mask_mod.undo_last() is None and mask_mod.last_edit_time() is None
+p1._on_mouse_moved(p1.viewbox.mapViewToScene(P(400, 300)))
+assert layer.status() == "" and "mask" not in p1.probe_label.text()
+ok("mask undo: every stroke and dab is one step, back to the empty mask")
+
+
+# Through the real scene: the mask overlay sits above the selection and its
+# handles and takes the brush's drags and clicks, so a stroke that starts on
+# a handle paints instead of resizing the selection; with the hand tool the
+# same drag still pans, and a shape tool still moves the selection.
+def scene_mouse(pane, kind, x, y, mods=Qt.NoModifier, held=True):
+    if kind == QEvent.MouseMove:
+        QTest.qWait(15)  # pyqtgraph drops moves closer than 10 ms apart (mouseRateLimit)
+    vp = pane.view.viewport()
+    pos = QPointF(pane.view.mapFromScene(pane.viewbox.mapViewToScene(QPointF(x, y))))
+    button = Qt.NoButton if kind == QEvent.MouseMove else Qt.LeftButton
+    buttons = Qt.LeftButton if held and kind != QEvent.MouseButtonRelease else Qt.NoButton
+    app.sendEvent(vp, QMouseEvent(kind, pos, QPointF(vp.mapToGlobal(pos.toPoint())), button, buttons, mods))
+    app.processEvents()
+
+
+def scene_drag(pane, points, mods=Qt.NoModifier, hover=True):
+    (x0, y0), rest = points[0], points[1:]
+    if hover:
+        scene_mouse(pane, QEvent.MouseMove, x0, y0, mods, held=False)
+    scene_mouse(pane, QEvent.MouseButtonPress, x0, y0, mods)
+    for x, y in rest:
+        scene_mouse(pane, QEvent.MouseMove, x, y, mods)
+    scene_mouse(pane, QEvent.MouseButtonRelease, *rest[-1], mods)
+
+
+p1.window().activateWindow()
+p1.zoom_fit()
+app.processEvents()
+roi.set_tool("rect")
+sel.set_rect(100, 100, 200, 150)
+roi.set_tool("brush")
+scene_drag(p1, [(300, 250), (340, 280), (380, 300)])  # starts on the bottom-right handle
+assert sel.describe() == "rect 100,100 200×150"  # neither moved nor resized
+assert layer.count > 800 and layer.data[250, 300] and layer.data[280, 340] and layer.data[300, 380]
+stroke_px = layer.count
+scene_drag(p1, [(150, 150), (200, 180)])  # inside the selection: paints, does not move it
+assert sel.describe() == "rect 100,100 200×150" and layer.count > stroke_px and layer.data[180, 200]
+n = layer.count
+scene_mouse(p1, QEvent.MouseMove, 500, 500, held=False)
+scene_mouse(p1, QEvent.MouseButtonPress, 500, 500)
+scene_mouse(p1, QEvent.MouseButtonRelease, 500, 500)
+assert sel.roi is not None and n + 60 < layer.count < n + 100 and layer.data[500, 500]  # a click: one dab
+mask_mod.set_brush_size(24)
+scene_drag(p1, [(480, 500), (520, 500)], mods=Qt.AltModifier)
+assert layer.count == n and not layer.data[494:507, 494:507].any()  # Alt+drag with the brush erases
+mask_mod.set_brush_size(10)
+# The hand pans — also right after a tool picked from the keyboard, with the
+# mouse still where the brush last hovered.
+p1.zoom(0.5)
+app.processEvents()
+scene_mouse(p1, QEvent.MouseMove, 300, 300, held=False)
+roi.set_tool("hand")
+before_rect = p1.viewbox.viewRect()
+scene_drag(p1, [(300, 300), (340, 320), (380, 340)], hover=False)
+after_rect = p1.viewbox.viewRect()
+assert before_rect.left() - after_rect.left() > 30 and before_rect.top() - after_rect.top() > 15  # panned
+assert abs(after_rect.width() - before_rect.width()) < 1e-6 and layer.count == n  # nothing painted
+roi.set_tool("rect")
+scene_drag(p1, [(180, 160), (220, 190), (260, 220)])  # a shape tool moves the selection again
+moved = sel._path().boundingRect()
+assert abs(moved.x() - 180) <= 1 and abs(moved.y() - 160) <= 1 and moved.width() == 200
+assert layer.count == n
+roi.set_tool("hand")
+sel.clear()
+p1.zoom_fit()
+app.processEvents()
+ok("scene dispatch: the brush paints over a selection and its handles, the hand pans, shapes move")
+
+
+# On screen the overlay covers exactly the painted pixels — a block of bright
+# pixels painted over one by one turns magenta inside its own outline and
+# nowhere else — and erasing one pixel takes the tint off just there.
+def view_rgb(pane):
+    img = pane.view.grab().toImage().convertToFormat(QImage.Format_RGBA8888)
+    rows = np.frombuffer(img.constBits(), np.uint8).reshape(img.height(), img.bytesPerLine())
+    return rows[:, : 4 * img.width()].reshape(img.height(), img.width(), 4)[..., :3].astype(int)
+
+
+def screen_box(hits):
+    rows, cols = np.nonzero(hits)
+    return int(rows.min()), int(rows.max()), int(cols.min()), int(cols.max())
+
+
+tiny = np.zeros((24, 32), np.uint8)
+tiny[5:8, 9:11] = 255
+tifffile.imwrite(Path(TMP) / "tiny_mask.tif", tiny)
+tp = workspace.show_stack(stack_io.load_stack(Path(TMP) / "tiny_mask.tif"))
+tp.window().resize(520, 480)
+app.processEvents()
+tp.zoom_fit()
+QTest.qWait(200)
+plain = view_rgb(tp)
+bright_box = screen_box(plain.sum(axis=2) > 600)
+assert bright_box[1] - bright_box[0] > 20  # zoomed in: an image pixel is many screen pixels
+roi.set_tool("brush")
+mask_mod.set_brush_size(1)
+for y in range(5, 8):
+    for x in range(9, 11):
+        tp.mask_layer.dab(P(x + 0.5, y + 0.5))
+app.processEvents()
+painted = view_rgb(tp)
+assert tp.mask_layer.count == 6
+tint_box = screen_box(np.abs(painted - plain).sum(axis=2) > 30)
+assert tint_box == bright_box, (tint_box, bright_box)
+r_, g_, b_ = painted[(bright_box[0] + bright_box[1]) // 2, (bright_box[2] + bright_box[3]) // 2]
+assert r_ == 255 and b_ == 255 and abs(g_ - 169) <= 2  # white under 45 % magenta
+roi.set_tool("eraser")
+tp.mask_layer.dab(P(9.5, 5.5))  # the block's top-left pixel
+app.processEvents()
+erased_box = screen_box(np.abs(view_rgb(tp) - painted).sum(axis=2) > 30)
+cell_h, cell_w = (bright_box[1] - bright_box[0] + 1) / 3, (bright_box[3] - bright_box[2] + 1) / 2
+assert erased_box[0] == bright_box[0] and erased_box[2] == bright_box[2]
+assert abs(erased_box[1] - erased_box[0] + 1 - cell_h) <= 1 and abs(erased_box[3] - erased_box[2] + 1 - cell_w) <= 1
+tp.window().close()
+app.processEvents()
+roi.set_tool("hand")
+mask_mod.set_brush_size(10)
+ok("on screen the mask overlay covers exactly the painted pixels")
+
+# Selections feed the mask: add one whole, cut one out; Clear empties it.
+layer.clear()
+sel.set_rect(10, 20, 64, 48)
+add_action.trigger()  # Analyze > Mask > Add Selection to Mask, on the active stack
+assert layer.count == 64 * 48 and layer.data[20:68, 10:74].all()
+assert "added to the mask" in p1.window().statusBar().currentMessage()
+sel.set_rect(10, 20, 64, 48, ellipse=True)
+ellipse_px = int(sel.mask()[1].sum())
+p1.mask_from_selection(subtract=True)
+assert layer.count == 64 * 48 - ellipse_px and not layer.data[44, 42] and layer.data[20, 10]
+steps = len(layer._undo)
+p1.mask_from_selection(subtract=True)  # nothing left to cut: not an undo step
+assert "already" in p1.window().statusBar().currentMessage() and len(layer._undo) == steps
+sel.clear()
+p1.mask_from_selection()
+assert "No selection" in p1.window().statusBar().currentMessage() and len(layer._undo) == steps
+p1.clear_mask()
+assert layer.is_empty() and "cleared" in p1.window().statusBar().currentMessage()
+p1.clear_mask()
+assert p1.window().statusBar().currentMessage() == "No mask to clear"
+# Cmd+Z is shared with contrast changes: whichever edit came last goes
+# first, across stacks; edits on a stack closed since are skipped.
+undo_action = next(
+    a for a in p1.window().findChildren(QAction) if a.text() == "&Undo Contrast / Mask Edit"
+)
+assert undo_action.shortcut() == QKeySequence(QKeySequence.Undo)
+roi.set_tool("brush")
+range_before = tuple(float(v) for v in p1.stack.ranges[0])
+bc_panel.push_range_undo([(p1.stack, 0, *range_before)])
+p1.stack.ranges[0] = (1.0, 50.0)
+QTest.qWait(3)
+layer.dab(P(400.5, 400.5))
+QTest.qWait(3)
+p2.mask_layer.dab(P(50.5, 50.5))
+QTest.qWait(3)
+bc_panel.push_range_undo([(p1.stack, 0, 1.0, 50.0)])
+p1.stack.ranges[0] = (2.0, 60.0)
+QTest.qWait(3)
+spare = workspace.show_stack(stack_io.load_stack(SPARE_STACK))
+app.processEvents()
+spare_layer = spare.mask_layer
+spare_layer.dab(P(20.5, 20.5))
+spare.window().close()  # its edit, the newest of all, goes with it
+app.processEvents()
+assert spare_layer._detached and not spare_layer.undoable()
+roi.set_tool("hand")  # a closed pane's layer no longer follows the tool
+undo_action.trigger()  # the second contrast change
+assert tuple(p1.stack.ranges[0]) == (1.0, 50.0) and p2.mask_layer.count == 81 and layer.count == 81
+undo_action.trigger()  # the dab on the other stack
+assert p2.mask_layer.is_empty() and layer.count == 81
+assert "Undid the mask edit on XY06.tif" in p2.window().statusBar().currentMessage()
+undo_action.trigger()  # the dab on this one
+assert layer.is_empty() and tuple(p1.stack.ranges[0]) == (1.0, 50.0)
+undo_action.trigger()  # the first contrast change: made after the Clear, so it goes before it
+assert tuple(float(v) for v in p1.stack.ranges[0]) == range_before and layer.is_empty()
+viewer.undo()  # the Clear
+assert layer.count == 64 * 48 - ellipse_px
+ok("selection added to / cut out of the mask, Clear; one Cmd+Z for masks and contrast, newest first")
+
+# Export Mask writes a black/white image of the frame's size, named after
+# the stack; Open Mask reads one back, whatever drew it, and refuses what
+# does not fit.
+mask_dir = Path(TMP) / "masks"
+mask_dir.mkdir()
+asked = []
+
+
+def asking(path):
+    return staticmethod(lambda *a, **_k: (asked.append(a) or str(path), ""))
+
+
+real_save_dialog, real_open_dialog = QFileDialog.getSaveFileName, QFileDialog.getOpenFileName
+real_critical = QMessageBox.critical
+problems = []
+try:
+    QMessageBox.critical = staticmethod(lambda _p, _title, text: problems.append(text))
+    stacks_dir_before = app_settings.last_dir()
+    png = mask_dir / "XY05.png"
+    QFileDialog.getSaveFileName = asking(png)
+    next(a for a in p1.window().findChildren(QAction) if a.text() == "&Export Mask...").trigger()
+    start = Path(asked[-1][2])
+    assert start.name == "XY05.png" and start.parent == p1.stack.path.parent  # next to the stack at first
+    img = QImage(str(png))
+    assert img.format() == QImage.Format_Grayscale8 and (img.width(), img.height()) == (960, 720)
+    px = np.frombuffer(img.constBits(), np.uint8).reshape(720, img.bytesPerLine())[:, :960]
+    assert set(np.unique(px).tolist()) == {0, 255} and np.array_equal(px > 0, layer.data)
+    assert np.array_equal(mask_mod.read_mask(png), layer.data)
+    assert "Exported mask" in p1.window().statusBar().currentMessage()
+    # Masks remember their own folder; the stacks' folder is left alone.
+    assert mask_mod.last_dir() == str(mask_dir) and app_settings.last_dir() == stacks_dir_before
+    QFileDialog.getSaveFileName = asking(mask_dir / "as_tiff.tif")
+    p1.export_mask()
+    assert Path(asked[-1][2]) == mask_dir / "XY05.png"
+    tif = tifffile.imread(mask_dir / "as_tiff.tif")
+    assert tif.dtype == np.uint8 and tif.shape == frame and set(np.unique(tif).tolist()) == {0, 255}
+    assert np.array_equal(tif > 0, layer.data)
+    QFileDialog.getSaveFileName = asking(mask_dir / "no_extension")
+    p1.export_mask()
+    assert (mask_dir / "no_extension.png").exists()  # PNG unless the name says TIFF
+    QFileDialog.getSaveFileName = asking(mask_dir / "missing" / "x.png")
+    p1.export_mask()
+    assert len(problems) == 1 and "x.png" in problems[0]  # a failed write is reported
+    assert mask_mod.last_dir() == str(mask_dir)
+    n_asked = len(asked)
+    p3.export_mask()  # nothing painted: nothing to export, no dialog
+    assert len(asked) == n_asked and "No mask to export" in p3.window().statusBar().currentMessage()
+    QFileDialog.getOpenFileName = staticmethod(lambda *_a, **_k: (str(png), ""))
+    p2.open_mask()
+    assert np.array_equal(p2.mask_layer.data, layer.data)
+    assert "Opened mask XY05.png" in p2.window().statusBar().currentMessage()
+    viewer.undo()
+    assert p2.mask_layer.is_empty()  # opening a mask is one undo step
+    # From elsewhere: bright strokes in any colour, alpha ignored, the
+    # threshold at half the value range; 16-bit and float TIFFs.
+    rgba = np.zeros((720, 960, 4), np.uint8)
+    rgba[100:110, 200:230] = (255, 0, 0, 255)
+    rgba[300:310, 50:60] = (0, 90, 0, 255)  # dimmer than half: not masked
+    QImage(rgba.data, 960, 720, 4 * 960, QImage.Format_RGBA8888).save(str(mask_dir / "rgba.png"))
+    colour = mask_mod.read_mask(mask_dir / "rgba.png")
+    assert colour.sum() == 10 * 30 and colour[100, 200] and not colour[300, 50]
+    tifffile.imwrite(mask_dir / "u16.tif", layer.data.astype(np.uint16) * 65535)
+    assert np.array_equal(mask_mod.read_mask(mask_dir / "u16.tif"), layer.data)
+    tifffile.imwrite(mask_dir / "f32.tif", layer.data.astype(np.float32))
+    assert np.array_equal(mask_mod.read_mask(mask_dir / "f32.tif"), layer.data)
+    tifffile.imwrite(mask_dir / "small.tif", np.full((100, 120), 255, np.uint8))
+    assert not p2.load_mask(mask_dir / "small.tif") and "120×100" in problems[-1]
+    (mask_dir / "text.png").write_text("not an image")
+    assert not p2.load_mask(mask_dir / "text.png") and len(problems) == 3 and p2.mask_layer.is_empty()
+finally:
+    QFileDialog.getSaveFileName, QFileDialog.getOpenFileName = real_save_dialog, real_open_dialog
+    QMessageBox.critical = real_critical
+ok("Export Mask: frame-sized 0/255 PNG or TIFF named after the stack; Open Mask round-trips, refuses misfits")
+
+# Sessions carry the mask as packed bits; one saved for another image size
+# (or mangled) is dropped rather than misapplied.
+saved = layer.to_json()
+assert set(saved) == {"shape", "bits"} and saved["shape"] == [720, 960] and len(saved["bits"]) < 2000
+p2.mask_layer.from_json(saved)
+assert np.array_equal(p2.mask_layer.data, layer.data) and not p2.mask_layer.undoable()
+p2.mask_layer.from_json({"shape": [10, 10], "bits": saved["bits"]})
+p2.mask_layer.from_json({"shape": [720, 960], "bits": "!!"})
+p2.mask_layer.from_json({"shape": [720, 960]})
+assert np.array_equal(p2.mask_layer.data, layer.data)
+assert p3.mask_layer.to_json() is None and p3.mask_layer.data is None
+p2.mask_layer.clear()
+mask_px = layer.count
+ok("mask session data: packed bits round-trip, wrong size and garbage dropped")
+
 print("sessions")
 workspace.combine_all()
 app.processEvents()
@@ -626,6 +1016,8 @@ assert data["workspace"]["minimalist"] is True
 grid_order = [q.stack.name for q in workspace.get_workspace().panes]
 assert [Path(e["path"]).name for e in data["stacks"]] == grid_order  # grid order kept
 assert next(e for e in data["stacks"] if e["path"].endswith("XY05.tif"))["flagged"] is True
+assert next(e for e in data["stacks"] if e["path"].endswith("XY05.tif"))["mask"]["shape"] == [720, 960]
+assert next(e for e in data["stacks"] if e["path"].endswith("XY06.tif"))["mask"] is None
 session.close_all()
 app.processEvents()
 assert len(viewer._all_panes) == 0
@@ -644,10 +1036,12 @@ assert restored.selection.describe() == "polygon 5,5 55×45"
 restored2 = next(p for p in viewer._all_panes if p.stack.name == "XY06.tif")
 assert restored2.selection.describe() == "ellipse 10,20 30×40"
 assert next(p for p in viewer._all_panes if p.stack.name == "XY07.tif").selection.roi is None
+assert restored.mask_layer.count == mask_px and restored.mask_layer.data[20, 10]  # the painted mask
+assert not restored.mask_layer.undoable() and restored2.mask_layer.is_empty()
 restored.mip_box.setChecked(False)
 restored.set_proj_method("Max", False)
 ws.minimal_checkbox.setChecked(False)
-ok("session round-trip incl. minimalist, grid order, flags and selections")
+ok("session round-trip incl. minimalist, grid order, flags, selections and masks")
 session.close_all()
 app.processEvents()
 

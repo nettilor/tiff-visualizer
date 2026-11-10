@@ -57,6 +57,10 @@ def show_bc_panel(target) -> "BCPanel":
 # old_hi). Weak references, so undo history never keeps a closed stack's
 # data in RAM; steps whose stacks have all closed are skipped.
 _undo_stack: list[list[tuple]] = []
+# When each step was last touched (time.monotonic()), in step with
+# _undo_stack: Cmd+Z is shared with mask edits (mask.py), and whichever edit
+# came last is the one it takes back (viewer.undo).
+_undo_times: list[float] = []
 _MAX_UNDO = 50
 _last_coalesce_key = None
 _last_push_time = 0.0
@@ -74,11 +78,34 @@ def push_range_undo(entries: list[tuple], coalesce_key=None):
         and _undo_stack
     ):
         _last_push_time = now
+        _undo_times[-1] = now
         return  # keep the gesture's original 'before' snapshot
     _undo_stack.append([(weakref.ref(stack), c, lo, hi) for stack, c, lo, hi in entries])
+    _undo_times.append(now)
     del _undo_stack[:-_MAX_UNDO]
+    del _undo_times[:-_MAX_UNDO]
     _last_coalesce_key = coalesce_key
     _last_push_time = now
+
+
+def _live_undo_entry(entry: list[tuple]) -> list[tuple]:
+    """The parts of an undo step whose stacks are still open."""
+    from .viewer import _all_panes
+
+    open_stacks = {id(pane.stack) for pane in _all_panes}
+    resolved = [(ref(), c, lo, hi) for ref, c, lo, hi in entry]
+    return [e for e in resolved if e[0] is not None and id(e[0]) in open_stacks]
+
+
+def last_undo_time() -> float | None:
+    """time.monotonic() of the latest contrast change that can still be
+    undone — steps whose stacks have all closed are dropped on the way."""
+    while _undo_stack:
+        if _live_undo_entry(_undo_stack[-1]):
+            return _undo_times[-1]
+        _undo_stack.pop()
+        _undo_times.pop()
+    return None
 
 
 def undo_last_range_change():
@@ -87,10 +114,9 @@ def undo_last_range_change():
     from .viewer import _all_panes
 
     _last_coalesce_key = None
-    open_stacks = {id(pane.stack) for pane in _all_panes}
     while _undo_stack:
-        entry = [(ref(), c, lo, hi) for ref, c, lo, hi in _undo_stack.pop()]
-        entry = [e for e in entry if e[0] is not None and id(e[0]) in open_stacks]
+        entry = _live_undo_entry(_undo_stack.pop())
+        _undo_times.pop()
         if entry:
             break
     else:
