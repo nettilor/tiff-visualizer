@@ -1,5 +1,35 @@
 # Changelog
 
+## 1.9.0 — 2026-11-11
+
+### Export
+- **Montages limited to the selection or the mask**: Export Stack Montage
+  and Export Grid Montage gain a **Region** choice — Whole image, Inside the
+  selection, Inside the mask. Only the pixels inside the region are
+  exported and everything else is black: the same pixels Cmd+M measures
+  (the shape exactly as drawn) or Export Mask writes. For compiling stacks
+  into representative images — draw a selection around the part worth
+  showing and export just that.
+- **Crop to the region's bounding box**, on by default: each tile is cut
+  down to the box around its region. Unchecked, tiles keep the full frame
+  with black outside the region.
+- **Stack montage**: the stack's one selection or mask applies to every t/z
+  tile, at any resolution — at half and quarter size a tile is exactly the
+  full-resolution result sampled the same way, and a region smaller than
+  the sampling step still leaves a pixel. The output-size estimate follows
+  the crop, and the entries say what they hold (`Inside the selection
+  (ellipse 100,50 200×120)`, `Inside the mask (6,600 px)`).
+- **Grid montage**: every tile inside its **own** selection or mask, in the
+  PNG and in GIF frames alike. Cells take the size of the largest crop and
+  smaller ones are centred; a tile without the chosen region is exported
+  whole, and the entry counts the tiles that have one (`Inside each tile's
+  selection (2 of 3 tiles)`).
+- Only regions that exist are offered — without a selection or a mask the
+  row is greyed out, with a hint. The choice and the crop box are remembered
+  like the other options (an export from a stack with no region leaves them
+  alone), and default names say so: `XY05_montage_t2-4_roi.png`,
+  `XY05_montage_mask.png`, `montage_roi.png`.
+
 ## 1.8.0 — 2026-11-10
 
 ### Masks

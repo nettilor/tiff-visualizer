@@ -52,10 +52,10 @@ automatically** in Settings turns the daily look off. That check is the only
 network request the app ever makes.
 
 For the check to find a build, a release needs a downloadable asset whose name
-says which platform it is for — `TIFF-Visualizer-1.8.0-macos.dmg` (what
-`packaging/make_dmg.sh` writes) and `TIFF-Visualizer-1.8.0-windows.zip`. A
+says which platform it is for — `TIFF-Visualizer-1.9.0-macos.dmg` (what
+`packaging/make_dmg.sh` writes) and `TIFF-Visualizer-1.9.0-windows.zip`. A
 release with no matching asset still gets offered; the alert then just opens
-the release page. Tags must be plain `v1.8.0`-style versions: anything else is
+the release page. Tags must be plain `v1.9.0`-style versions: anything else is
 deliberately never offered (`tiff_visualizer/updater.py`).
 
 ## Setup
@@ -176,6 +176,11 @@ shown at the bottom. Closing the control window quits the app.
   file per channel** (`…_C1.png`, `…_C2.png`, …). A title line above the
   sheet names the stack, channels and projection (`XY05.tif  ·  c 1+2  z MIP`)
   so a sheet always says where it came from; a checkbox turns it off.
+  **Region** limits the sheet to the stack's **selection or mask**: only the
+  pixels inside it are exported, everything else is black, and every tile is
+  **cropped to the region's bounding box** — or keeps the full frame when the
+  crop box is unchecked. The size estimate follows the crop and the default
+  name says so (`XY05_montage_roi.png`, `…_mask.png`).
 - **Cmd+Alt+S / Cmd+Alt+O / Cmd+Alt+R**: save / open / restore-last session
   (open stacks, positions, contrast, layout — auto-saved on quit).
 - **?** shows the keyboard cheatsheet. Adjacent planes are pre-rendered and
@@ -230,7 +235,13 @@ with its name **and where it came from** — `XY05.tif  ·  c 1+2  z 5  t 12`,
 with the projection (`z MIP`, `z AVG`, …) in place of the slice when it is on
 and GIF frames following the movie — on two lines when a cell is too narrow
 for one; checkboxes turn names and positions off. With ★ only or solo
-active, the montage exports what you see.
+active, the montage exports what you see. **Region** exports each tile only
+**inside its own selection or mask** — black outside, and cropped to the
+region's bounding box unless the crop box is unchecked (cells take the size
+of the largest crop, smaller ones are centred); a tile without one is
+exported whole, and the dialog says how many tiles have one. Draw a
+selection on each stack around the part worth showing and the montage is a
+row of crops (`montage_roi.png`).
 
 Panes are moved, never rebuilt: position, zoom and contrast survive every
 combine/split, and each floating window's position and size are remembered,
@@ -377,7 +388,9 @@ still pans, and so does a drag that starts outside the image.
 **Cmd+Z** takes mask edits back one at a time — a stroke, a dab, a selection
 added or cut out, Clear and Open Mask are one step each — and shares the key
 with contrast changes: the latest edit of either kind goes first. Masks are
-saved in sessions. Exported views (PNG, GIF, montages) do not show the mask.
+saved in sessions. Exported views (PNG, GIF, montages) do not show the mask
+overlay; the two montage exports can be limited to the pixels inside it
+(**Region → Inside the mask**).
 
 ## Projections — Cmd+Shift+P
 

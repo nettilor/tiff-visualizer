@@ -1430,6 +1430,182 @@ finally:
         cls.exec = QDialog.exec
 ok("exports: movie, stack montage and grid GIF follow their ranges and name them")
 
+# Montages limited to a region: only the pixels inside the selection or the
+# mask, black outside, cut to the region's bounding box unless told not to.
+img16 = (np.arange(16 * 16 * 3, dtype=np.uint32) % 251 + 1).astype(np.uint8).reshape(16, 16, 3)
+hit = np.ones((8, 8), dtype=bool)
+hit[:3, :3] = False  # a notch: the region is not its bounding box
+box = ((slice(3, 11), slice(5, 13)), hit)
+full_mask = np.zeros((16, 16), dtype=bool)
+full_mask[3:11, 5:13] = hit
+blacked = img16 * full_mask[..., None]
+assert np.array_equal(viewer.clip_to_region(img16, box, crop=False), blacked)
+assert np.array_equal(viewer.clip_to_region(img16, box), blacked[3:11, 5:13])
+assert viewer.region_shape(box) == (8, 8)
+# At a stride, the tile is what the full-resolution result looks like sampled
+# the same way: rendered pixel i shows image pixel i * stride.
+for stride in (2, 4):
+    sampled = viewer.clip_to_region(img16[::stride, ::stride], box, stride, crop=False)
+    assert np.array_equal(sampled, blacked[::stride, ::stride]), stride
+    cut = viewer.clip_to_region(img16[::stride, ::stride], box, stride)
+    assert cut.shape[:2] == viewer.region_shape(box, stride)
+    assert np.array_equal(cut, blacked[::stride, ::stride][-(-3 // stride):-(-11 // stride), -(-5 // stride):-(-13 // stride)])
+sliver = ((slice(5, 7), slice(1, 3)), np.ones((2, 2), dtype=bool))  # between sampled pixels
+assert viewer.region_shape(sliver, 4) == (1, 1)
+assert viewer.clip_to_region(img16[::4, ::4], sliver, 4).shape == (1, 1, 3)
+ok("region clipping: black outside, cropped to the box, exact at every stride")
+
+p.selection.set_rect(100, 50, 200, 120, ellipse=True)
+sel = p.export_region("selection")
+assert sel[0] == (slice(50, 170), slice(100, 300)) and not sel[1][0, 0] and sel[1][60, 100]
+assert p.export_region("mask") is None and p.export_region("whole") is None
+chans = p._display_channels()
+whole = np.asarray(p._stack_montage_image([0, 1, 2, 3], [0], chans, 1, False))
+cropped = np.asarray(p._stack_montage_image([0, 1, 2, 3], [0], chans, 1, False, region=sel))
+kept = np.asarray(p._stack_montage_image([0, 1, 2, 3], [0], chans, 1, False, region=sel, crop=False))
+assert cropped.shape[:2] == (2 * 120, 2 * 200) and kept.shape == whole.shape
+sel_full = np.zeros(p.stack.shape_yx, dtype=bool)
+sel_full[sel[0]] = sel[1]
+for row, col in ((0, 0), (0, 1), (1, 0), (1, 1)):  # every tile, not just the first
+    tile = whole[row * 720:(row + 1) * 720, col * 960:(col + 1) * 960]
+    kept_tile = kept[row * 720:(row + 1) * 720, col * 960:(col + 1) * 960]
+    assert np.array_equal(kept_tile, tile * sel_full[..., None])
+    assert np.array_equal(cropped[row * 120:(row + 1) * 120, col * 200:(col + 1) * 200], kept_tile[50:170, 100:300])
+assert cropped.max() > 0 and cropped[0, 0].max() == 0  # the ellipse's corner is outside it
+quarter = p._stack_montage_image([0, 1], [0, 4], chans, 4, True, region=sel, title=True)
+q_h, q_w = viewer.region_shape(sel, 4)
+assert (q_h, q_w) == (30, 50)
+assert quarter.size == (int(16 * 2.4) + 2 * q_w, 2 * 16 + 2 * q_h)  # title + t header, z gutter
+# The mask works the same way, and neither region is confused with the other.
+painted = np.zeros(p.stack.shape_yx, dtype=bool)
+painted[400:460, 20:110] = True
+painted[430:520, 60:80] = True
+p.mask_layer.set_array(painted, undoable=False)
+msk = p.export_region("mask")
+assert msk[0] == (slice(400, 520), slice(20, 110)) and np.array_equal(msk[1], painted[400:520, 20:110])
+by_mask = np.asarray(p._stack_montage_image([0, 1], [0], chans, 1, False, grid=(2, 1), region=msk))
+assert by_mask.shape[:2] == (120, 2 * 90)
+assert np.array_equal(by_mask[:, :90], whole[400:520, 20:110] * painted[400:520, 20:110, None])
+ok("stack montage inside the selection / the mask: cropped or full frame, any resolution")
+
+# The dialog offers only the regions the stack has, sizes its estimate by the
+# crop, and remembers the choice — also across a stack that has no region.
+d = viewer.StackMontageDialog(p)
+texts = [d.region.combo.itemText(i) for i in range(d.region.combo.count())]
+assert texts == ["Whole image", "Inside the selection (ellipse 100,50 200×120)", "Inside the mask (6,600 px)"], texts
+assert d.region.values() == ("whole", True) and not d.region.crop_box.isEnabled()
+d.scale_combo.setCurrentIndex(0)
+d.z_combo.setCurrentIndex(0)
+nc, nr, _both = d._grid()  # t across × z down, at the remembered steps
+
+
+def estimate(cell_w, cell_h):
+    return f"{nc}×{nr} tiles · ≈{nc * cell_w}×{nr * cell_h} px"
+
+
+assert d.estimate.text() == estimate(960, 720), d.estimate.text()
+d.region.combo.setCurrentIndex(1)
+assert d.region.crop_box.isEnabled() and d.estimate.text() == estimate(200, 120)
+d.region.combo.setCurrentIndex(2)
+assert d.estimate.text() == estimate(90, 120)
+d.scale_combo.setCurrentIndex(2)
+assert d.estimate.text() == estimate(23, 30), d.estimate.text()
+d.region.crop_box.setChecked(False)
+assert d.estimate.text() == estimate(240, 180)
+d.accept()
+assert viewer.StackMontageDialog(p).region.values() == ("mask", False)
+p.mask_layer.set_array(np.zeros(p.stack.shape_yx, dtype=bool), undoable=False)
+d = viewer.StackMontageDialog(p)  # the remembered mask is gone: whole image
+assert d.region.combo.count() == 2 and d.region.values()[0] == "whole"
+d.region.combo.setCurrentIndex(1)
+d.region.crop_box.setChecked(True)
+d.accept()
+held_roi = p.selection.to_json()
+p.selection.clear()
+d = viewer.StackMontageDialog(p)
+assert d.region.combo.count() == 1 and not d.region.combo.isEnabled()
+assert d.region.values()[0] == "whole" and d.region.current() == [None]
+d.accept()  # nothing to choose from: the remembered region stays
+p.selection.from_json(held_roi)
+assert viewer.StackMontageDialog(p).region.values() == ("selection", True)
+ok("stack montage dialog: region choices, cropped size estimate, remembered")
+
+# The grid: every tile inside its own selection, letterboxed into cells the
+# size of the largest; a tile without one is exported whole.
+others = [workspace.show_stack(stack_io.load_stack(str(path))) for path in STACKS[:2]]
+assert all(q.stack.shape_yx == p.stack.shape_yx for q in others)
+workspace.combine_all()
+app.processEvents()
+gws = workspace.get_workspace()
+tiles = list(gws.panes)
+assert len(tiles) == 3 and p in tiles, len(tiles)
+others[0].selection.set_rect(300, 200, 80, 300)
+regions = [q.export_region("selection") for q in tiles]
+assert [r is not None for r in regions] == [q in (p, others[0]) for q in tiles]
+two = [p, others[0]]
+two_regions = [regions[tiles.index(q)] for q in two]
+plain = np.asarray(gws._montage_image(two, 1, labels=False))
+cut = np.asarray(gws._montage_image(two, 1, labels=False, regions=two_regions))
+assert cut.shape[:2] == (300, 2 * 200)  # 200×120 and 80×300 in 200×300 cells
+assert np.array_equal(cut[90:210, :200], plain[50:170, 100:300] * sel[1][..., None])
+assert cut[:90, :200].max() == 0 and cut[210:, :200].max() == 0  # letterboxed
+h1, w1 = two[0].stack.shape_yx
+assert np.array_equal(cut[:, 260:340], plain[200:500, w1 + 300:w1 + 380])
+assert cut[:, 200:260].max() == 0 and cut[:, 340:].max() == 0
+framed = np.asarray(gws._montage_image(two, 1, labels=False, regions=two_regions, crop=False))
+assert framed.shape == plain.shape
+assert np.array_equal(framed[:h1, :w1], plain[:h1, :w1] * sel_full[..., None])
+halved = gws._montage_image(two, 2, labels=True, info=True, regions=two_regions)
+assert halved.width == 2 * 100 and halved.height > 150
+mixed = np.asarray(gws._montage_image(tiles, 1, labels=False, regions=regions))
+assert mixed.shape == np.asarray(gws._montage_image(tiles, 1, labels=False)).shape  # the whole tile sets the cells
+d = workspace.MontageDialog(None, tiles)
+texts = [d.region.combo.itemText(i) for i in range(d.region.combo.count())]
+assert texts == ["Whole image", "Inside each tile's selection (2 of 3 tiles)"], texts
+assert d.region.values() == ("whole", True)
+d.reject()
+d = workspace.MontageDialog(None, two)  # every tile has one: no count
+assert d.region.combo.itemText(1) == "Inside each tile's selection"
+d.reject()
+try:
+    viewer.StackMontageDialog.exec = lambda self: (  # remembered: the selection, cropped
+        self.z_combo.setCurrentIndex(0), self.scale_combo.setCurrentIndex(0),
+        self.t_spin.setValue(1), self.z_spin.setValue(1), QDialog.Accepted,
+    )[-1]
+    QFileDialog.getSaveFileName = save_as("roi_sheet.png")
+    p.export_stack_montage()
+    assert offered_names[-1] == f"{stem}_montage_roi.png", offered_names[-1]
+    assert Image.open(os.path.join(TMP, "roi_sheet.png")).size == (8 * 200, 9 * 120)
+    workspace.MontageDialog.exec = lambda self: (
+        self.mode_combo.setCurrentIndex(0), self.scale_combo.setCurrentIndex(0),
+        self.region.combo.setCurrentIndex(1), self.labels_box.setChecked(False),
+        self.info_box.setChecked(False), QDialog.Accepted,
+    )[-1]
+    QFileDialog.getSaveFileName = save_as("roi_grid.png")
+    gws._export_montage()
+    assert offered_names[-1] == "montage_roi.png", offered_names[-1]
+    assert np.array_equal(np.asarray(Image.open(os.path.join(TMP, "roi_grid.png"))), mixed)
+    workspace.MontageDialog.exec = lambda self: (
+        self.mode_combo.setCurrentIndex(0), self.region.combo.setCurrentIndex(0), QDialog.Accepted
+    )[-1]
+    gws._export_montage()
+    assert offered_names[-1] == "montage.png"  # the whole image: no suffix
+finally:
+    QFileDialog.getSaveFileName = real_save
+    for cls in (viewer.StackMontageDialog, workspace.MontageDialog):
+        cls.exec = QDialog.exec
+for q in tiles:
+    q.selection.clear()
+d = viewer.StackMontageDialog(p)
+d.accept()
+app_settings.settings().remove("dialogs/stackMontage/region")
+app_settings.settings().remove("dialogs/stackMontage/crop")
+gws.close_panes(others)
+workspace.split_all()
+app.processEvents()
+assert viewer._all_panes == [p]
+ok("grid montage inside each tile's selection; default names end in _roi")
+
 print("updates")
 from datetime import datetime, timedelta  # noqa: E402
 

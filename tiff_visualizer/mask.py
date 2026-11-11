@@ -316,6 +316,18 @@ class MaskLayer:
             return np.zeros(self.pane.stack.shape_yx, dtype=bool)
         return self.data.copy()
 
+    def region(self):
+        """((y slice, x slice), bool array): the mask cut to its bounding
+        box, in the form roi.Selection.mask() returns a selection; None
+        without a mask."""
+        if not self.count:
+            return None
+        rows = np.flatnonzero(self.data.any(axis=1))
+        cols = np.flatnonzero(self.data.any(axis=0))
+        ys = slice(int(rows[0]), int(rows[-1]) + 1)
+        xs = slice(int(cols[0]), int(cols[-1]) + 1)
+        return (ys, xs), self.data[ys, xs].copy()
+
     def status(self) -> str:
         """'mask 3,214 px (0.47%)' for the probe row; empty without a mask."""
         if not self.count:

@@ -40,14 +40,18 @@ from . import stack_io
 from . import viewer
 from .stack_io import TiffStack
 from .viewer import (
+    REGION_SUFFIX,
     AxisRange,
     DimBar,
     FileDropMixin,
+    RegionOptions,
     StackPane,
     StackWindow,
     build_menus,
     caption_lines,
+    clip_to_region,
     position_caption,
+    region_shape,
 )
 
 _workspace: "WorkspaceWindow | None" = None
@@ -262,6 +266,9 @@ class MontageDialog(QDialog):
                 form.addRow(f"{letter.lower()} range:", self.ranges[letter])
         form.addRow("Frames/second:", self.fps_spin)
         form.addRow("Resolution:", self.scale_combo)
+        # Each tile inside its own selection or mask, see viewer.RegionOptions.
+        self.region = RegionOptions(panes)
+        self.region.add_rows(form)
         form.addRow("", self.labels_box)
         form.addRow("", self.info_box)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -279,6 +286,7 @@ class MontageDialog(QDialog):
         }
         for letter, rng in self.ranges.items():
             self._remembered[f"{letter.lower()}Range"] = rng
+        self._remembered.update(self.region.remembered())
         app_settings.restore_widgets("gridMontage", self._remembered)
         self._on_mode()
 
@@ -999,16 +1007,27 @@ class WorkspaceWindow(FileDropMixin, QMainWindow):
 
     # ---- grid montage export -------------------------------------------
 
-    def _montage_image(self, panes, scale=1, labels=True, t=None, z=None, info=False):
+    def _montage_image(
+        self, panes, scale=1, labels=True, t=None, z=None, info=False, regions=None, crop=True
+    ):
         """One montage frame: the given panes in grid order, each rendered at
         full resolution with its current contrast/channels/projection, labeled and
         letterboxed into equal cells. t/z override the position per axis.
         ``info`` adds each tile's channels, z (or projection) and t to its
-        label, on a second line when name and position don't fit one."""
+        label, on a second line when name and position don't fit one.
+        ``regions`` — one per pane (StackPane.export_region), None for a tile
+        exported whole — limits each tile to that part of its image: black
+        outside it, and cut to its bounding box with ``crop``."""
         from PIL import Image, ImageDraw, ImageFont
 
-        cell_w = max(p.stack.shape_yx[1] for p in panes) // scale
-        cell_h = max(p.stack.shape_yx[0] for p in panes) // scale
+        regions = regions or [None] * len(panes)
+
+        def tile_shape(pane, region):
+            return region_shape(region) if region is not None and crop else pane.stack.shape_yx
+
+        shapes = [tile_shape(pane, region) for pane, region in zip(panes, regions)]
+        cell_w = max(max(w // scale, 1) for _h, w in shapes)
+        cell_h = max(max(h // scale, 1) for h, _w in shapes)
         line_h = max(16, cell_h // 16)
         cols = self._grid_cols(len(panes))
         rows = math.ceil(len(panes) / cols)
@@ -1067,9 +1086,10 @@ class WorkspaceWindow(FileDropMixin, QMainWindow):
                 canvas.paste(strip, (cx, cy))
             if blank:
                 continue
-            tile = Image.fromarray(
-                pane._full_res_rgb(t=shown_t, z=min(shown_z, s.n_slices - 1), channels=channels)
-            )
+            rgb = pane._full_res_rgb(t=shown_t, z=min(shown_z, s.n_slices - 1), channels=channels)
+            if regions[i] is not None:
+                rgb = clip_to_region(rgb, regions[i], crop=crop)
+            tile = Image.fromarray(rgb)
             if scale > 1:
                 tile = tile.resize(
                     (max(tile.width // scale, 1), max(tile.height // scale, 1)), Image.LANCZOS
@@ -1092,10 +1112,15 @@ class WorkspaceWindow(FileDropMixin, QMainWindow):
         if dialog.exec() != QDialog.Accepted:
             return
         kind, axis, fps, scale, labels, info, frame_range = dialog.values()
+        source, crop = dialog.region.values()
+        regions = [pane.export_region(source) for pane in panes]
         suffix = "png" if kind == "png" else "gif"
-        default = f"montage.{suffix}" if axis is None else f"montage_{axis}.{suffix}"
+        default = "montage" if axis is None else f"montage_{axis}"
         if axis is not None and dialog.ranges[axis].narrowed():
-            default = f"montage_{axis.lower()}{dialog.ranges[axis].span()}.{suffix}"
+            default = f"montage_{axis.lower()}{dialog.ranges[axis].span()}"
+        if any(region is not None for region in regions):
+            default += REGION_SUFFIX[source]  # limited to the selections / masks
+        default += f".{suffix}"
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Export grid montage",
@@ -1107,7 +1132,9 @@ class WorkspaceWindow(FileDropMixin, QMainWindow):
         app_settings.set_last_dir(str(Path(path).parent))
         if kind == "png":
             try:
-                self._montage_image(panes, scale, labels, info=info).save(path)
+                self._montage_image(
+                    panes, scale, labels, info=info, regions=regions, crop=crop
+                ).save(path)
             except (OSError, ValueError) as exc:
                 _export_failed(self, path, exc)
                 return
@@ -1128,6 +1155,8 @@ class WorkspaceWindow(FileDropMixin, QMainWindow):
                 t=i if axis == "T" else None,
                 z=i if axis == "Z" else None,
                 info=info,
+                regions=regions,
+                crop=crop,
             )
             # Quantize per frame immediately: a full-RGB frame list for 48
             # tiles over a long t range would not fit in RAM.

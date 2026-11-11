@@ -1536,21 +1536,44 @@ class StackPane(QWidget):
             return
         _show_status(f"Exported {count} frames to {path}", 5000, self)
 
+    def export_region(self, source: str):
+        """The part of the image a montage export is limited to: the
+        selection ("selection") or the mask ("mask"), as ((y slice, x slice),
+        bool array) over its bounding box — the pixels Cmd+M measures and
+        Export Mask writes. None for "whole", and when the stack has no such
+        region inside the image."""
+        if source == "selection":
+            region = self.selection.mask()
+        elif source == "mask":
+            region = self.mask_layer.region()
+        else:
+            region = None
+        if region is None or not region[1].any():
+            return None
+        return region
+
     # ---- stack montage (t across, z down) ------------------------------
 
     def _stack_montage_image(
         self, t_idx, z_idx, channels, stride, labels, mip=False, on_tile=None, grid=None,
-        method="Max", title=False,
+        method="Max", title=False, region=None, crop=True,
     ):
         """One montage sheet of this stack: t across columns, z down rows;
         a single varying axis wraps into a near-square grid instead, or into
         the (cols, rows) ``grid`` when given (row-major; surplus cells stay
         black). ``title`` heads the sheet with the stack name, channels and
         whatever position the tiles share (the z projection, when collapsed).
+        ``region`` (see export_region) limits every tile to that part of the
+        image — black outside it, and cut to its bounding box with ``crop``.
         Returns a PIL image, or None if on_tile() reported a cancel."""
         from PIL import Image, ImageDraw, ImageFont
 
         s = self.stack
+
+        def render(t, z):
+            rgb = s.render(t, z, channels, stride, mip, method)
+            return rgb if region is None else clip_to_region(rgb, region, stride, crop)
+
         both = len(t_idx) > 1 and len(z_idx) > 1
         if both:
             rows, cols = len(z_idx), len(t_idx)
@@ -1572,7 +1595,7 @@ class StackPane(QWidget):
                 )
                 for i, v in enumerate(seq)
             ]
-        first = s.render(cells[0][0], cells[0][1], channels, stride, mip, method)
+        first = render(cells[0][0], cells[0][1])
         cell_h, cell_w = first.shape[:2]
         # t/z headers frame the sheet when both axes vary; a wrapped single
         # axis labels each tile's corner instead.
@@ -1611,11 +1634,7 @@ class StackPane(QWidget):
                 draw.text((4, top + r * cell_h + 3), f"z {z_idx[r] + 1}", fill=gray, font=font)
         rendered = first
         for t, z, r, c, corner in cells:
-            rgb = (
-                rendered
-                if rendered is not None
-                else s.render(t, z, channels, stride, mip, method)
-            )
+            rgb = rendered if rendered is not None else render(t, z)
             rendered = None
             x, y = gutter_w + c * cell_w, top + r * cell_h
             canvas.paste(Image.fromarray(rgb), (x, y))
@@ -1637,6 +1656,8 @@ class StackPane(QWidget):
             return
         (t_step, z_step, mip, stride, per_channel, labels, grid, title,
          t_range, z_range) = dialog.values()
+        source, crop = dialog.region.values()
+        region = self.export_region(source)
         t0, z0, _c0 = self.position()
         t_idx = list(range(t_range[0], t_range[1] + 1, t_step)) if s.n_frames > 1 else [t0]
         z_idx = (
@@ -1644,7 +1665,8 @@ class StackPane(QWidget):
             if s.n_slices > 1 and not mip
             else [z0]
         )
-        # The name carries a narrowed range, and the projection when z collapses.
+        # The name carries a narrowed range, the projection when z collapses,
+        # and the region the sheet is limited to.
         name = Path(s.name).stem + "_montage"
         if dialog.t_range.narrowed():
             name += f"_t{dialog.t_range.span()}"
@@ -1652,6 +1674,8 @@ class StackPane(QWidget):
             name += f"_{stack_io.PROJECTION_ABBREV[self.proj_method]}"
         elif dialog.z_range.narrowed():
             name += f"_z{dialog.z_range.span()}"
+        if region is not None:
+            name += REGION_SUFFIX[source]
         start = Path(app_settings.last_dir() or Path.home()) / f"{name}.png"
         path, _ = QFileDialog.getSaveFileName(
             self, "Export stack montage", str(start), "PNG (*.png)"
@@ -1680,7 +1704,7 @@ class StackPane(QWidget):
         for i, channels in enumerate(channel_sets):
             img = self._stack_montage_image(
                 t_idx, z_idx, channels, stride, labels, mip, tick, grid, self.proj_method,
-                title,
+                title, region, crop,
             )
             if img is None:  # canceled
                 return
@@ -1710,6 +1734,123 @@ def _montage_grid(n: int, grid=None) -> tuple[int, int]:
         return cols, math.ceil(n / cols)
     cols = max(1, int(grid[0]))
     return cols, max(1, int(grid[1]), math.ceil(n / cols))
+
+
+# What a montage can be limited to besides the whole image (see
+# StackPane.export_region), and how its default file name says so.
+REGION_SUFFIX = {"selection": "_roi", "mask": "_mask"}
+
+
+def _sampled(span: slice, stride: int) -> tuple[int, int, np.ndarray]:
+    """Where an image span lands in a plane rendered at this stride (pixel i
+    of the render shows image pixel i * stride): the rendered range
+    [first, stop) and, for each of its pixels, the span-relative image index
+    it shows. A span that falls between two rendered pixels takes the one
+    before it, so a region is never cropped away entirely."""
+    first, stop = -(-span.start // stride), -(-span.stop // stride)
+    if stop <= first:
+        first, stop = span.start // stride, span.start // stride + 1
+    shown = np.arange(first, stop) * stride - span.start
+    return first, stop, np.clip(shown, 0, span.stop - span.start - 1)
+
+
+def region_shape(region, stride: int = 1) -> tuple[int, int]:
+    """(height, width) of a plane cropped to a region at this stride."""
+    (ys, xs), _hit = region
+    (y0, y1, _), (x0, x1, _) = _sampled(ys, stride), _sampled(xs, stride)
+    return y1 - y0, x1 - x0
+
+
+def clip_to_region(rgb: np.ndarray, region, stride: int = 1, crop: bool = True) -> np.ndarray:
+    """A rendered plane limited to a region (StackPane.export_region, in
+    full-resolution image pixels): black outside it and, with crop, cut to
+    its bounding box. ``stride`` is the one the plane was rendered at."""
+    (ys, xs), hit = region
+    y0, y1, rows = _sampled(ys, stride)
+    x0, x1, cols = _sampled(xs, stride)
+    inside = hit[np.ix_(rows, cols)][..., None]
+    cut = rgb[y0:y1, x0:x1] * inside.astype(rgb.dtype)
+    if crop:
+        return cut
+    out = np.zeros_like(rgb)
+    out[y0:y1, x0:x1] = cut
+    return out
+
+
+class RegionOptions:
+    """The Region rows of the montage dialogs: export the whole image, or
+    only what lies inside each stack's selection or mask — black outside it
+    and, unless unchecked, cropped to its bounding box. Only the regions the
+    given panes have are on offer; a stack without the chosen one is exported
+    whole."""
+
+    def __init__(self, panes: list["StackPane"]):
+        self.panes = panes
+        self.regions = {
+            source: [pane.export_region(source) for pane in panes]
+            for source in ("selection", "mask")
+        }
+        self.combo = QComboBox()
+        self.combo.addItem("Whole image", "whole")
+        for source in ("selection", "mask"):
+            have = [r for r in self.regions[source] if r is not None]
+            if have:
+                self.combo.addItem(self._label(source, len(have)), source)
+        self.crop_box = QCheckBox("Crop to the region's bounding box")
+        self.crop_box.setChecked(True)
+        self.crop_box.setToolTip(
+            "On: each image is cut down to the box around its region.\n"
+            "Off: it keeps the full frame, black outside the region."
+        )
+        if self.combo.count() == 1:
+            self.combo.setEnabled(False)
+            self.combo.setToolTip(
+                "Draw a selection (R / E / P / D) or paint a mask (B) to export\n"
+                "only that part of the image"
+            )
+        else:
+            self.combo.setToolTip(
+                "Export only the pixels inside the selection or the mask;\n"
+                "everything else is black"
+                + ("\nA tile without one is exported whole" if len(panes) > 1 else "")
+            )
+        self.combo.currentIndexChanged.connect(self._sync)
+        self._sync()
+
+    def _label(self, source: str, count: int) -> str:
+        if len(self.panes) > 1:
+            some = "" if count == len(self.panes) else f" ({count} of {len(self.panes)} tiles)"
+            return f"Inside each tile's {source}{some}"
+        pane = self.panes[0]
+        detail = (
+            pane.selection.describe()
+            if source == "selection"
+            else f"{pane.mask_layer.count:,} px"
+        )
+        return f"Inside the {source} ({detail})"
+
+    def _sync(self, *_):
+        self.crop_box.setEnabled(self.combo.currentData() != "whole")
+
+    def add_rows(self, form: QFormLayout):
+        form.addRow("Region:", self.combo)
+        form.addRow("", self.crop_box)
+
+    def remembered(self) -> dict[str, QWidget]:
+        """For settings.save_widgets: nothing when no region was on offer,
+        so that export leaves the remembered choice alone."""
+        if self.combo.count() == 1:
+            return {}
+        return {"region": self.combo, "crop": self.crop_box}
+
+    def values(self) -> tuple[str, bool]:
+        """("whole" | "selection" | "mask", crop to the bounding box)."""
+        return self.combo.currentData(), self.crop_box.isChecked()
+
+    def current(self) -> list:
+        """The chosen region of each pane, None where it is exported whole."""
+        source = self.combo.currentData()
+        return self.regions.get(source, [None] * len(self.panes))
 
 
 def position_caption(stack, channels, t=None, z=None, proj=None) -> str:
@@ -1860,6 +2001,8 @@ class StackMontageDialog(QDialog):
             self.channels_combo.addItem("As displayed (visible channels)", False)
             self.channels_combo.addItem("One file per channel", True)
             form.addRow("Channels:", self.channels_combo)
+        self.region = RegionOptions([pane])
+        self.region.add_rows(form)
         self.labels_box = QCheckBox("t/z position labels")
         self.labels_box.setChecked(True)
         form.addRow("", self.labels_box)
@@ -1880,6 +2023,8 @@ class StackMontageDialog(QDialog):
             self.z_combo.currentIndexChanged,
             self.layout_combo.currentIndexChanged,
             self.scale_combo.currentIndexChanged,
+            self.region.combo.currentIndexChanged,
+            self.region.crop_box.toggled,
         ):
             signal.connect(self._update_estimate)
         self.cols_spin.valueChanged.connect(
@@ -1920,6 +2065,7 @@ class StackMontageDialog(QDialog):
         widgets["scale"] = self.scale_combo
         if self.channels_combo is not None:
             widgets["channels"] = self.channels_combo
+        widgets.update(self.region.remembered())
         widgets["labels"] = self.labels_box
         widgets["title"] = self.title_box
         return widgets
@@ -1989,6 +2135,9 @@ class StackMontageDialog(QDialog):
         stride = self.scale_combo.currentData()
         h, w = s.shape_yx
         cell_w, cell_h = len(range(0, w, stride)), len(range(0, h, stride))
+        region = self.region.current()[0]
+        if region is not None and self.region.crop_box.isChecked():
+            cell_h, cell_w = region_shape(region, stride)
         text = f"{cols}×{rows} tiles · ≈{cols * cell_w}×{rows * cell_h} px"
         empty = cols * rows - n
         if not both and empty > 0:
